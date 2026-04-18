@@ -1,0 +1,17 @@
+CUDA_VISIBLE_DEVICES=0 python scripts/dino_v2_vlad_CVGL.py \
+    --prog.cache-dir .cache \
+    --task-mode cvgl \
+    --cvgl-dataset-root data/California_wildfire_2025_2_336_intile \
+    --data-split test \
+    --model-type dinov2_vitg14 \
+    --global-agg vlad \
+    --num-clusters 32 \
+    --desc-layer 31 \
+    --desc-facet key \
+    --coarse-top-k 10 \
+    --tile-size-px 512 \
+    --use-local-rerank \
+    --local-match-method sim_map \
+    --use-offset-head \
+    --offset-prediction-method sim_map \
+    --exp-id cvgl_baseline_run

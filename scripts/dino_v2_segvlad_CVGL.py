@@ -37,7 +37,7 @@ import numpy as np
 import torch
 import tyro
 import wandb
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Literal, Optional, Union
 
 from configs import BaseDatasetArgs, ProgArgs, base_dataset_args, device
@@ -66,6 +66,7 @@ from cvgl_retrieval import (
     predict_top1_offsets,
     rerank_with_local_features,
 )
+from segvlad_masking import RevisitAnythingSAMGenerator, SegmentorConfig
 from dvgl_benchmark.datasets_ws import BaseDataset
 from utilities import DinoV2ExtractFeatures, seed_everything
 
@@ -123,6 +124,7 @@ class LocalArgs:
     segment_top_k: int = 100
     segvlad_min_mask_area_ratio: float = 0.0
     segvlad_neighbor_order: int = 0
+    seg_cfg: SegmentorConfig = field(default_factory=SegmentorConfig)
 
 
 def _load_anyloc_dataset(largs: LocalArgs):
@@ -187,11 +189,14 @@ def _build_dense_cache_root(largs: LocalArgs):
         dataset_cache_id,
         f"{largs.model_type}-{largs.desc_facet}-L{largs.desc_layer}-segvlad",
     )
-    if not largs.cache_dense_features:
-        return None, None
-    dense_root = os.path.join(base_dir, "dense")
+    dense_root = None
+    if largs.cache_dense_features:
+        dense_root = os.path.join(base_dir, "dense")
     vlad_root = os.path.join(base_dir, f"vlad-C{largs.num_clusters}")
-    return dense_root, vlad_root
+    masks_root = None
+    if largs.seg_cfg.cache_generated_masks:
+        masks_root = os.path.join(base_dir, "sam_masks")
+    return dense_root, vlad_root, masks_root
 
 
 def _collect_gt_db_indices(dataset, db_indices, qu_indices) -> List[Optional[int]]:
@@ -210,7 +215,7 @@ def main(largs: LocalArgs):
     print(f"Arguments: {largs}")
     seed_everything(42)
     dataset = _load_dataset(largs)
-    dense_cache_root, vlad_cache_root = _build_dense_cache_root(largs)
+    dense_cache_root, vlad_cache_root, masks_cache_root = _build_dense_cache_root(largs)
 
     wandb_run = None
     if largs.prog.use_wandb:
@@ -250,6 +255,19 @@ def main(largs: LocalArgs):
         feature_cache_root=dense_cache_root,
         vlad_cache_root=vlad_cache_root,
     )
+    sam_generator = None
+    seg_cfg_runtime = largs.seg_cfg
+    if largs.seg_cfg.source in ["sam", "manifest_or_sam"]:
+        try:
+            sam_generator = RevisitAnythingSAMGenerator(
+                largs.seg_cfg,
+                device=str(device),
+            )
+        except Exception as exc:
+            if largs.seg_cfg.source == "sam":
+                raise
+            print(f"WARN: SAM generator unavailable, falling back to manifest/full-image masks: {exc}")
+            seg_cfg_runtime = replace(largs.seg_cfg, source="manifest")
 
     db_bank = build_segvlad_feature_bank(
         dataset,
@@ -258,8 +276,11 @@ def main(largs: LocalArgs):
         device=device,
         vlad=vlad,
         feature_cache_root=dense_cache_root,
+        masks_cache_root=masks_cache_root,
         min_mask_area_ratio=largs.segvlad_min_mask_area_ratio,
         neighbor_order=largs.segvlad_neighbor_order,
+        seg_cfg=seg_cfg_runtime,
+        sam_generator=sam_generator,
     )
     qu_bank = build_segvlad_feature_bank(
         dataset,
@@ -268,8 +289,11 @@ def main(largs: LocalArgs):
         device=device,
         vlad=vlad,
         feature_cache_root=dense_cache_root,
+        masks_cache_root=masks_cache_root,
         min_mask_area_ratio=largs.segvlad_min_mask_area_ratio,
         neighbor_order=largs.segvlad_neighbor_order,
+        seg_cfg=seg_cfg_runtime,
+        sam_generator=sam_generator,
     )
     print("--------- SegVLAD banks ready ---------")
 

@@ -13,6 +13,13 @@ import torch.nn.functional as F
 from torchvision import transforms as T
 from tqdm.auto import tqdm
 
+from segvlad_masking import (
+    RevisitAnythingSAMGenerator,
+    SegmentorConfig,
+    build_mask_adjacency_revisit,
+    load_or_generate_masks,
+    project_masks_to_patch_grid,
+)
 from utilities import DinoV2ExtractFeatures, VLAD
 
 
@@ -395,11 +402,28 @@ def build_segvlad_feature_bank(
     device: torch.device,
     vlad: VLAD,
     feature_cache_root: Optional[str] = None,
+    masks_cache_root: Optional[str] = None,
     patch_stride: int = 14,
     min_mask_area_ratio: float = 0.0,
     neighbor_order: int = 0,
+    seg_cfg: Optional[SegmentorConfig] = None,
+    sam_generator: Optional[RevisitAnythingSAMGenerator] = None,
     verbose: bool = True,
 ) -> SegVLADFeatureBank:
+    if seg_cfg is None:
+        seg_cfg = SegmentorConfig()
+    if sam_generator is None and seg_cfg.source in ["sam", "manifest_or_sam"]:
+        try:
+            sam_generator = RevisitAnythingSAMGenerator(
+                seg_cfg,
+                device=str(device),
+            )
+        except Exception as exc:
+            if seg_cfg.source == "sam":
+                raise
+            if verbose:
+                print(f"WARN: SAM generator unavailable, falling back to manifest/full-image masks: {exc}")
+
     relpaths = []
     all_locals = []
     grid_hws = []
@@ -417,17 +441,27 @@ def build_segvlad_feature_bank(
             cache_root=feature_cache_root, global_agg="vlad",
             patch_stride=patch_stride,
         )
-        masks = None
-        if hasattr(dataset, "get_segmentation_masks"):
-            masks = dataset.get_segmentation_masks(idx)
-        mask_grid = masks_to_patch_grid(
+        masks = load_or_generate_masks(
+            dataset,
+            idx,
+            seg_cfg=seg_cfg,
+            mask_generator=sam_generator,
+            cache_root=masks_cache_root,
+        )
+        mask_grid, pixel_masks = project_masks_to_patch_grid(
             masks,
             image_hw=record.image_hw,
             cropped_hw=record.cropped_hw,
             grid_hw=record.grid_hw,
             min_area_ratio=min_mask_area_ratio,
         )
-        adjacency = build_mask_adjacency(mask_grid, grid_hw=record.grid_hw, order=neighbor_order)
+        adjacency = build_mask_adjacency_revisit(
+            mask_grid,
+            pixel_masks=pixel_masks,
+            grid_hw=record.grid_hw,
+            order=neighbor_order,
+            method=seg_cfg.neighbor_method,
+        )
         local_flat = record.local_desc.reshape(-1, record.local_desc.shape[-1])
         seg_descs = segvlad_descriptors(local_flat, vlad.c_centers, mask_grid, adjacency=adjacency)
 

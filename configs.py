@@ -62,14 +62,14 @@ class ProgArgs:
         Core program arguments
     """
     # A directory for storing cache
-    cache_dir: Path = "/ocean/projects/cis220039p/jkarhade/data/vlvpr_cache"#f"/scratch/{user_name}/vl-vpr/cache"
+    cache_dir: Path = Path("/ocean/projects/cis220039p/jkarhade/data/vlvpr_cache")#f"/scratch/{user_name}/vl-vpr/cache"
     """
         Directory for cache storage. Values:
         - Avneesh: f"/scratch/{user_name}/vl-vpr/cache"
         - Jay: '/home/jay/Documents/vl-vpr'
     """
     # The directory where 'datasets-vg' are downloaded
-    data_vg_dir: Path = "/ocean/projects/cis220039p/shared/datasets/vpr/datasets_vg"#f"{lib_path}/datasets_vg/datasets"
+    data_vg_dir: Path = Path("/ocean/projects/cis220039p/shared/datasets/vpr/datasets_vg")#f"{lib_path}/datasets_vg/datasets"
     """
         Directory where the datasets are stored. Values:
         - Avneesh: f"{lib_path}/datasets_vg/datasets"

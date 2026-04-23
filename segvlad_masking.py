@@ -21,69 +21,36 @@ from scipy.spatial import Delaunay
 @dataclass
 class SegmentorConfig:
     source: Literal["manifest", "sam", "manifest_or_sam"] = "manifest_or_sam"
-    sam_checkpoint: Optional[str] = None
-    sam_repo_root: Optional[str] = None
+    sam_checkpoint: Optional[str] = "checkpoints/sam_vit_h_4b8939.pth"
+    sam_repo_root: Optional[str] = "sam"
     sam_model_type: Literal["vit_h", "vit_l", "vit_b", "default"] = "vit_h"
-    sam_resize: Literal["half", "full"] = "half"
-    sam_min_area_px: int = 0
+    sam_resize: Literal["half", "full"] = "full"
     sam_max_masks: Optional[int] = None
-    sam_points_per_side: Optional[int] = None
-    sam_pred_iou_thresh: float = 0.88
-    sam_stability_score_thresh: float = 0.95
+    sam_points_per_side: int = 64
+    sam_points_per_batch: int = 128
+    sam_pred_iou_thresh: float = 0.80
+    sam_stability_score_thresh: float = 0.88
     sam_crop_n_layers: int = 0
+    sam_crop_nms_thresh: float = 0.7
+    sam_crop_overlap_ratio: float = 0.35
+    sam_crop_n_points_downscale_factor: float = 1
+    sam_min_area_px: int = 25
     cache_generated_masks: bool = True
     neighbor_method: Literal["delaunay", "knn"] = "delaunay"
 
 
-def _detect_revisit_anything_root(explicit_root: Optional[str] = None) -> Optional[str]:
-    candidates = [
-        explicit_root,
-        os.environ.get("REVISIT_ANYTHING_ROOT"),
-        "/data/zhanghaofei/xry/Revisit-Anything",
-    ]
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        candidate = os.path.realpath(os.path.expanduser(candidate))
-        sam_dir = os.path.join(candidate, "sam")
-        if os.path.isdir(sam_dir):
-            return candidate
-    return None
-
-
-def _detect_sam_checkpoint(explicit_checkpoint: Optional[str] = None) -> Optional[str]:
-    candidates = [
-        explicit_checkpoint,
-        os.environ.get("SAM_CHECKPOINT"),
-        "/data/zhanghaofei/xry/AnyLoc/checkpoints/sam_vit_h_4b8939.pth",
-    ]
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        candidate = os.path.realpath(os.path.expanduser(candidate))
-        if os.path.isfile(candidate):
-            return candidate
-    return None
-
-
-class RevisitAnythingSAMGenerator:
+class SAMGenerator:
     """
-        Lightweight wrapper around Revisit-Anything's vendored SAM package.
+        Lightweight wrapper around SAM package.
     """
     def __init__(self, cfg: SegmentorConfig, device: str = "cuda") -> None:
-        checkpoint = _detect_sam_checkpoint(cfg.sam_checkpoint)
+        checkpoint = cfg.sam_checkpoint
         if checkpoint is None:
             raise ValueError(
                 "SAM generation requires a valid checkpoint. "
                 "Set `seg_cfg.sam_checkpoint` or `SAM_CHECKPOINT`."
             )
-        ra_root = _detect_revisit_anything_root(cfg.sam_repo_root)
-        if ra_root is None:
-            raise ValueError(
-                "Could not locate Revisit-Anything `sam` package. "
-                "Set `seg_cfg.sam_repo_root` or `REVISIT_ANYTHING_ROOT`."
-            )
-        sam_pkg_root = os.path.join(ra_root, "sam")
+        sam_pkg_root = os.path.join(Path(__file__).parent, "sam")
         if sam_pkg_root not in sys.path:
             sys.path.append(sam_pkg_root)
         from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
@@ -97,9 +64,15 @@ class RevisitAnythingSAMGenerator:
             "pred_iou_thresh": float(cfg.sam_pred_iou_thresh),
             "stability_score_thresh": float(cfg.sam_stability_score_thresh),
             "crop_n_layers": int(cfg.sam_crop_n_layers),
+            "points_per_side": int(cfg.sam_points_per_side),
+            "points_per_batch": int(cfg.sam_points_per_batch),
+            "crop_nms_thresh": float(cfg.sam_crop_nms_thresh),
+            "crop_overlap_ratio": float(cfg.sam_crop_overlap_ratio),
+            "crop_n_points_downscale_factor": float(cfg.sam_crop_n_points_downscale_factor),
+            "min_mask_region_area": int(cfg.sam_min_area_px),
         }
-        if cfg.sam_points_per_side is not None:
-            generator_kwargs["points_per_side"] = int(cfg.sam_points_per_side)
+        # if cfg.sam_points_per_side is not None:
+        #     generator_kwargs["points_per_side"] = int(cfg.sam_points_per_side)
         self.mask_generator = SamAutomaticMaskGenerator(model, **generator_kwargs)
         self.cfg = cfg
         self.device = device
@@ -119,9 +92,9 @@ class RevisitAnythingSAMGenerator:
         raw_masks = self.mask_generator.generate(image_for_sam)
         masks: List[np.ndarray] = []
         for item in raw_masks:
-            area = int(item.get("area", 0))
-            if area < int(self.cfg.sam_min_area_px):
-                continue
+            # area = int(item.get("area", 0))
+            # if area < int(self.cfg.sam_min_area_px):
+            #     continue
             seg = np.asarray(item["segmentation"]).astype(bool)
             masks.append(seg)
             if self.cfg.sam_max_masks is not None and len(masks) >= int(self.cfg.sam_max_masks):
@@ -145,7 +118,7 @@ def load_or_generate_masks(
     dataset,
     index: int,
     seg_cfg: SegmentorConfig,
-    mask_generator: Optional[RevisitAnythingSAMGenerator] = None,
+    mask_generator: Optional[SAMGenerator] = None,
     cache_root: Optional[str] = None,
 ) -> Optional[List[np.ndarray]]:
     if hasattr(dataset, "get_segmentation_masks"):

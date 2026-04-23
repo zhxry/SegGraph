@@ -37,7 +37,7 @@ import numpy as np
 import torch
 import tyro
 import wandb
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from typing import List, Literal, Optional, Union
 
 from configs import BaseDatasetArgs, ProgArgs, base_dataset_args, device
@@ -66,12 +66,14 @@ from cvgl_retrieval import (
     predict_top1_offsets,
     rerank_with_local_features,
 )
-from segvlad_masking import RevisitAnythingSAMGenerator, SegmentorConfig
+from segvlad_masking import SAMGenerator, SegmentorConfig
 from dvgl_benchmark.datasets_ws import BaseDataset
 from utilities import DinoV2ExtractFeatures, seed_everything
 
 
 def _to_jsonable(value):
+    if is_dataclass(value):
+        return _to_jsonable(asdict(value))
     if isinstance(value, dict):
         return {str(k): _to_jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -85,6 +87,52 @@ def _to_jsonable(value):
     if isinstance(value, np.generic):
         return value.item()
     return value
+
+
+def _build_run_config_snapshot(
+    largs: "LocalArgs",
+    dataset,
+    dense_cache_root: Optional[str],
+    vlad_cache_root: Optional[str],
+    masks_cache_root: Optional[str],
+    pretrained_vlad_cache_root: Optional[str],
+    seg_cfg_runtime: SegmentorConfig,
+):
+    return {
+        "cli_args": _to_jsonable(largs),
+        "resolved": {
+            "cwd": os.getcwd(),
+            "argv": list(sys.argv),
+            "task_mode": str(largs.task_mode),
+            "dataset_class": dataset.__class__.__name__,
+            "database_num": int(dataset.database_num),
+            "queries_num": int(dataset.queries_num),
+            "device": str(device),
+            "dense_cache_root": None if dense_cache_root is None else os.path.abspath(dense_cache_root),
+            "vlad_cache_root": None if vlad_cache_root is None else os.path.abspath(vlad_cache_root),
+            "masks_cache_root": None if masks_cache_root is None else os.path.abspath(masks_cache_root),
+            "pretrained_vlad_cache_root": (
+                None if pretrained_vlad_cache_root is None else os.path.abspath(pretrained_vlad_cache_root)
+            ),
+            "pretrained_vlad_centers": (
+                None if largs.pretrained_vlad_centers is None
+                else os.path.abspath(os.path.expanduser(str(largs.pretrained_vlad_centers)))
+            ),
+            "cvgl_dataset_root": (
+                None if largs.cvgl_dataset_root is None
+                else os.path.abspath(os.path.expanduser(str(largs.cvgl_dataset_root)))
+            ),
+            "cvgl_tiles_manifest": (
+                None if largs.cvgl_tiles_manifest is None
+                else os.path.abspath(os.path.expanduser(str(largs.cvgl_tiles_manifest)))
+            ),
+            "cvgl_queries_manifest": (
+                None if largs.cvgl_queries_manifest is None
+                else os.path.abspath(os.path.expanduser(str(largs.cvgl_queries_manifest)))
+            ),
+            "seg_cfg_runtime": _to_jsonable(seg_cfg_runtime),
+        },
+    }
 
 
 @dataclass
@@ -107,6 +155,12 @@ class LocalArgs:
     show_plot: bool = False
     vlad_assignment: Literal["hard", "soft"] = "hard"
     vlad_soft_temp: float = 1.0
+    pretrained_vlad_centers: Union[str, None] = None
+    """
+        Optional path to a precomputed `c_centers.pt`.
+        When set, the script loads this VLAD vocabulary directly and
+        skips fitting clusters on the current database split.
+    """
     cache_dense_features: bool = True
     use_local_rerank: bool = True
     coarse_top_k: int = 10
@@ -122,6 +176,7 @@ class LocalArgs:
     cvgl_tiles_manifest: Union[str, None] = None
     cvgl_queries_manifest: Union[str, None] = None
     segment_top_k: int = 100
+    coarse_aggregation: Literal["sum", "revisit_weighted_borda_image"] = "revisit_weighted_borda_image"
     segvlad_min_mask_area_ratio: float = 0.0
     segvlad_neighbor_order: int = 0
     seg_cfg: SegmentorConfig = field(default_factory=SegmentorConfig)
@@ -199,6 +254,33 @@ def _build_dense_cache_root(largs: LocalArgs):
     return dense_root, vlad_root, masks_root
 
 
+def _resolve_pretrained_vlad_cache_root(largs: LocalArgs) -> Optional[str]:
+    if largs.pretrained_vlad_centers is None:
+        return None
+    c_centers_path = os.path.abspath(os.path.expanduser(str(largs.pretrained_vlad_centers)))
+    if not os.path.isfile(c_centers_path):
+        raise FileNotFoundError(f"Pretrained VLAD centers not found: {c_centers_path}")
+    if os.path.basename(c_centers_path) != "c_centers.pt":
+        raise ValueError(
+            "pretrained_vlad_centers must point to a file named `c_centers.pt`, "
+            f"got: {c_centers_path}"
+        )
+    c_centers = torch.load(c_centers_path, map_location="cpu")
+    if c_centers.ndim != 2:
+        raise ValueError(
+            f"Invalid pretrained VLAD centers shape: {tuple(c_centers.shape)}. "
+            "Expected [num_clusters, desc_dim]."
+        )
+    if c_centers.shape[0] != int(largs.num_clusters):
+        raise ValueError(
+            "pretrained_vlad_centers cluster count does not match "
+            f"`num_clusters`: {c_centers.shape[0]} vs {largs.num_clusters}"
+        )
+    print(f"Using pretrained VLAD centers: {c_centers_path}")
+    print(f"Pretrained VLAD centers shape: {tuple(c_centers.shape)}")
+    return os.path.dirname(c_centers_path)
+
+
 def _collect_gt_db_indices(dataset, db_indices, qu_indices) -> List[Optional[int]]:
     db_index_map = {int(orig_idx): bank_idx for bank_idx, orig_idx in enumerate(db_indices.tolist())}
     gt_db_indices: List[Optional[int]] = []
@@ -216,6 +298,9 @@ def main(largs: LocalArgs):
     seed_everything(42)
     dataset = _load_dataset(largs)
     dense_cache_root, vlad_cache_root, masks_cache_root = _build_dense_cache_root(largs)
+    pretrained_vlad_cache_root = _resolve_pretrained_vlad_cache_root(largs)
+    if pretrained_vlad_cache_root is not None:
+        vlad_cache_root = pretrained_vlad_cache_root
 
     wandb_run = None
     if largs.prog.use_wandb:
@@ -259,7 +344,7 @@ def main(largs: LocalArgs):
     seg_cfg_runtime = largs.seg_cfg
     if largs.seg_cfg.source in ["sam", "manifest_or_sam"]:
         try:
-            sam_generator = RevisitAnythingSAMGenerator(
+            sam_generator = SAMGenerator(
                 largs.seg_cfg,
                 device=str(device),
             )
@@ -268,6 +353,16 @@ def main(largs: LocalArgs):
                 raise
             print(f"WARN: SAM generator unavailable, falling back to manifest/full-image masks: {exc}")
             seg_cfg_runtime = replace(largs.seg_cfg, source="manifest")
+
+    run_config = _build_run_config_snapshot(
+        largs,
+        dataset=dataset,
+        dense_cache_root=dense_cache_root,
+        vlad_cache_root=vlad_cache_root,
+        masks_cache_root=masks_cache_root,
+        pretrained_vlad_cache_root=pretrained_vlad_cache_root,
+        seg_cfg_runtime=seg_cfg_runtime,
+    )
 
     db_bank = build_segvlad_feature_bank(
         dataset,
@@ -302,6 +397,7 @@ def main(largs: LocalArgs):
         qu_bank,
         top_k=max(max(largs.top_k_vals), largs.coarse_top_k),
         segment_top_k=largs.segment_top_k,
+        aggregation=largs.coarse_aggregation,
     )
     gt_db_indices = _collect_gt_db_indices(dataset, db_indices, qu_indices)
     coarse_metrics = evaluate_cvgl_retrieval(
@@ -365,21 +461,28 @@ def main(largs: LocalArgs):
         )
 
     results = {
+        "CVGL-Dataset": str(largs.cvgl_dataset_root),
         "Model-Type": str(largs.model_type),
         "Desc-Layer": str(largs.desc_layer),
         "Desc-Facet": str(largs.desc_facet),
         "DB-Name": str(largs.prog.vg_dataset_name),
         "Task-Mode": str(largs.task_mode),
         "Agg-Method": "SegVLAD",
+        "Pretrained-VLAD-Centers": (
+            None if largs.pretrained_vlad_centers is None
+            else os.path.abspath(os.path.expanduser(str(largs.pretrained_vlad_centers)))
+        ),
         "Num-DB": str(len(db_bank.indices)),
         "Num-QU": str(len(qu_bank.indices)),
         "Num-DB-Segments": int(db_bank.segment_descs.shape[0]),
         "Num-QU-Segments": int(qu_bank.segment_descs.shape[0]),
         "Segment-TopK": int(largs.segment_top_k),
+        "Coarse-Aggregation": str(largs.coarse_aggregation),
         "Coarse-TopK": str(largs.coarse_top_k),
         "Local-Rerank": bool(largs.use_local_rerank),
         "Offset-Method": str(largs.offset_prediction_method),
         "Timestamp": time.strftime("%Y_%m_%d_%H_%M_%S"),
+        "Run-Config": run_config,
     }
     for key, val in coarse_metrics.items():
         results[f"Coarse-{key}"] = val

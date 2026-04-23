@@ -37,7 +37,7 @@ import numpy as np
 import torch
 import tyro
 import wandb
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import List, Literal, Optional, Union
 
 from configs import BaseDatasetArgs, ProgArgs, base_dataset_args, device
@@ -72,6 +72,8 @@ from utilities import DinoV2ExtractFeatures, reduce_pca, seed_everything
 
 
 def _to_jsonable(value):
+    if is_dataclass(value):
+        return _to_jsonable(asdict(value))
     if isinstance(value, dict):
         return {str(k): _to_jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -85,6 +87,48 @@ def _to_jsonable(value):
     if isinstance(value, np.generic):
         return value.item()
     return value
+
+
+def _build_run_config_snapshot(
+    largs: "LocalArgs",
+    dataset,
+    dense_cache_root: Optional[str],
+    vlad_cache_root: Optional[str],
+    pretrained_vlad_cache_root: Optional[str] = None,
+):
+    return {
+        "cli_args": _to_jsonable(largs),
+        "resolved": {
+            "cwd": os.getcwd(),
+            "argv": list(sys.argv),
+            "task_mode": str(largs.task_mode),
+            "dataset_class": dataset.__class__.__name__,
+            "database_num": int(dataset.database_num),
+            "queries_num": int(dataset.queries_num),
+            "device": str(device),
+            "dense_cache_root": None if dense_cache_root is None else os.path.abspath(dense_cache_root),
+            "vlad_cache_root": None if vlad_cache_root is None else os.path.abspath(vlad_cache_root),
+            "pretrained_vlad_cache_root": (
+                None if pretrained_vlad_cache_root is None else os.path.abspath(pretrained_vlad_cache_root)
+            ),
+            "pretrained_vlad_centers": (
+                None if largs.pretrained_vlad_centers is None
+                else os.path.abspath(os.path.expanduser(str(largs.pretrained_vlad_centers)))
+            ),
+            "cvgl_dataset_root": (
+                None if largs.cvgl_dataset_root is None
+                else os.path.abspath(os.path.expanduser(str(largs.cvgl_dataset_root)))
+            ),
+            "cvgl_tiles_manifest": (
+                None if largs.cvgl_tiles_manifest is None
+                else os.path.abspath(os.path.expanduser(str(largs.cvgl_tiles_manifest)))
+            ),
+            "cvgl_queries_manifest": (
+                None if largs.cvgl_queries_manifest is None
+                else os.path.abspath(os.path.expanduser(str(largs.cvgl_queries_manifest)))
+            ),
+        },
+    }
 
 
 @dataclass
@@ -113,6 +157,13 @@ class LocalArgs:
     show_plot: bool = False
     vlad_assignment: Literal["hard", "soft"] = "hard"
     vlad_soft_temp: float = 1.0
+    pretrained_vlad_centers: Union[str, None] = None
+    """
+        Optional path to a precomputed `c_centers.pt`.
+        When set together with `global_agg="vlad"`, the script loads
+        this VLAD vocabulary directly and skips fitting clusters on
+        the current database split.
+    """
     cache_vlad_descs: bool = False
     cache_dense_features: bool = True
     global_agg: Literal["vlad", "gem"] = "vlad"
@@ -216,6 +267,33 @@ def _build_cache_roots(largs: LocalArgs):
     return dense_root, vlad_root
 
 
+def _resolve_pretrained_vlad_cache_root(largs: LocalArgs) -> Optional[str]:
+    if largs.pretrained_vlad_centers is None:
+        return None
+    c_centers_path = os.path.abspath(os.path.expanduser(str(largs.pretrained_vlad_centers)))
+    if not os.path.isfile(c_centers_path):
+        raise FileNotFoundError(f"Pretrained VLAD centers not found: {c_centers_path}")
+    if os.path.basename(c_centers_path) != "c_centers.pt":
+        raise ValueError(
+            "pretrained_vlad_centers must point to a file named `c_centers.pt`, "
+            f"got: {c_centers_path}"
+        )
+    c_centers = torch.load(c_centers_path, map_location="cpu")
+    if c_centers.ndim != 2:
+        raise ValueError(
+            f"Invalid pretrained VLAD centers shape: {tuple(c_centers.shape)}. "
+            "Expected [num_clusters, desc_dim]."
+        )
+    if c_centers.shape[0] != int(largs.num_clusters):
+        raise ValueError(
+            "pretrained_vlad_centers cluster count does not match "
+            f"`num_clusters`: {c_centers.shape[0]} vs {largs.num_clusters}"
+        )
+    print(f"Using pretrained VLAD centers: {c_centers_path}")
+    print(f"Pretrained VLAD centers shape: {tuple(c_centers.shape)}")
+    return os.path.dirname(c_centers_path)
+
+
 def _maybe_apply_pca(largs: LocalArgs, db_global: torch.Tensor, qu_global: torch.Tensor):
     if largs.pca_dim_reduce is None:
         return db_global, qu_global
@@ -248,9 +326,20 @@ def main(largs: LocalArgs):
     seed_everything(42)
     dataset = _load_dataset(largs)
     dense_cache_root, vlad_cache_root = _build_cache_roots(largs)
+    pretrained_vlad_cache_root = _resolve_pretrained_vlad_cache_root(largs)
+    if pretrained_vlad_cache_root is not None:
+        if largs.global_agg != "vlad":
+            raise ValueError("pretrained_vlad_centers can only be used when global_agg='vlad'")
+        vlad_cache_root = pretrained_vlad_cache_root
+    run_config = _build_run_config_snapshot(
+        largs,
+        dataset=dataset,
+        dense_cache_root=dense_cache_root,
+        vlad_cache_root=vlad_cache_root,
+        pretrained_vlad_cache_root=pretrained_vlad_cache_root,
+    )
 
     wandb_run = None
-    wandb = None
     if largs.prog.use_wandb:
         wandb_run = wandb.init(
             project=largs.prog.wandb_proj,
@@ -388,18 +477,27 @@ def main(largs: LocalArgs):
         )
 
     results = {
+        "CVGL-Dataset": str(largs.cvgl_dataset_root),
         "Model-Type": str(largs.model_type),
         "Desc-Layer": str(largs.desc_layer),
         "Desc-Facet": str(largs.desc_facet),
         "DB-Name": str(largs.prog.vg_dataset_name),
         "Task-Mode": str(largs.task_mode),
         "Agg-Method": str(largs.global_agg).upper(),
+        "Num-Clusters": int(largs.num_clusters),
+        "VLAD-Assignment": str(largs.vlad_assignment),
+        "VLAD-Soft-Temp": float(largs.vlad_soft_temp),
+        "Pretrained-VLAD-Centers": (
+            None if largs.pretrained_vlad_centers is None
+            else os.path.abspath(os.path.expanduser(str(largs.pretrained_vlad_centers)))
+        ),
         "Num-DB": str(len(db_bank.indices)),
         "Num-QU": str(len(qu_bank.indices)),
         "Coarse-TopK": str(largs.coarse_top_k),
         "Local-Rerank": bool(largs.use_local_rerank),
         "Offset-Method": str(largs.offset_prediction_method),
         "Timestamp": time.strftime("%Y_%m_%d_%H_%M_%S"),
+        "Run-Config": run_config,
     }
     for key, val in coarse_metrics.items():
         results[f"Coarse-{key}"] = val

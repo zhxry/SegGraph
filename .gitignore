@@ -1,5 +1,9 @@
+.vscode/
 data/
 __pycache__/
 .cache/
 checkpoints/
+tmp/
+logs/
 .codex
+nohup.out

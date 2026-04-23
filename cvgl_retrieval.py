@@ -14,7 +14,7 @@ from torchvision import transforms as T
 from tqdm.auto import tqdm
 
 from segvlad_masking import (
-    RevisitAnythingSAMGenerator,
+    SAMGenerator,
     SegmentorConfig,
     build_mask_adjacency_revisit,
     load_or_generate_masks,
@@ -407,14 +407,14 @@ def build_segvlad_feature_bank(
     min_mask_area_ratio: float = 0.0,
     neighbor_order: int = 0,
     seg_cfg: Optional[SegmentorConfig] = None,
-    sam_generator: Optional[RevisitAnythingSAMGenerator] = None,
+    sam_generator: Optional[SAMGenerator] = None,
     verbose: bool = True,
 ) -> SegVLADFeatureBank:
     if seg_cfg is None:
         seg_cfg = SegmentorConfig()
     if sam_generator is None and seg_cfg.source in ["sam", "manifest_or_sam"]:
         try:
-            sam_generator = RevisitAnythingSAMGenerator(
+            sam_generator = SAMGenerator(
                 seg_cfg,
                 device=str(device),
             )
@@ -499,6 +499,7 @@ def coarse_retrieve_topk_segvlad(
     query_bank: SegVLADFeatureBank,
     top_k: int,
     segment_top_k: int = 100,
+    aggregation: Literal["sum", "revisit_weighted_borda_image"] = "revisit_weighted_borda_image",
 ) -> Tuple[np.ndarray, np.ndarray]:
     db_segments = F.normalize(db_bank.segment_descs.float(), dim=1)
     num_images = len(db_bank.indices)
@@ -510,12 +511,26 @@ def coarse_retrieve_topk_segvlad(
         seg_k = min(int(segment_top_k), sims.shape[1])
         top_scores, top_indices = torch.topk(sims, k=seg_k, dim=1)
         image_scores = torch.zeros(num_images, dtype=torch.float32)
-        image_scores.index_add_(
-            0,
-            db_bank.segment_to_image_pos[top_indices.reshape(-1)],
-            top_scores.reshape(-1),
-        )
-        image_scores = image_scores / max(1, q_segments.shape[0])
+        if aggregation == "sum":
+            image_scores.index_add_(
+                0,
+                db_bank.segment_to_image_pos[top_indices.reshape(-1)],
+                top_scores.reshape(-1),
+            )
+            image_scores = image_scores / max(1, q_segments.shape[0])
+        elif aggregation == "revisit_weighted_borda_image":
+            sims_min = float(top_scores.min().item())
+            sims_max = float(top_scores.max().item())
+            denom = max(1e-12, sims_max - sims_min)
+            norm_scores = (top_scores - sims_min) / denom
+            image_ids = db_bank.segment_to_image_pos[top_indices]
+            image_scores.index_add_(
+                0,
+                image_ids.reshape(-1),
+                norm_scores.reshape(-1),
+            )
+        else:
+            raise ValueError(f"Unknown SegVLAD coarse aggregation: {aggregation}")
         img_k = min(int(top_k), num_images)
         best_scores, best_indices = torch.topk(image_scores, k=img_k, dim=0)
         score_rows.append(best_scores)

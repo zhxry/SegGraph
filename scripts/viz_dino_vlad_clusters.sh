@@ -1,7 +1,9 @@
 python scripts/viz_dino_vlad_clusters.py \
     --dataset-root data/Hawaii_wildfire_2023_1_336_intile \
-    --c-centers .cache/cvgl_descs/Hawaii_wildfire_2023_1_336_intile-2db138713ce6/dinov2_vitg14-key-L23-segvlad/vlad-C32/c_centers.pt \
-    --output-dir .cache/viz_clusters/Hawaii_1_cur_key23 \
+    --c-centers .cache/cvgl_descs/Hawaii_wildfire_2023_1_336_intile-2db138713ce6/dinov2_vitg14-value-L23-segvlad/vlad-C32/c_centers.pt \
+    --output-dir .cache/viz_clusters/Hawaii_1_cur_value23 \
+    --desc-layer 23 \
+    --desc-facet value \
     --device cuda
     # --c-centers .cache/cvgl_descs/Hawaii_wildfire_2023_1_336_intile-2db138713ce6/dinov2_vitg14-key-L31-segvlad/vlad-C32/c_centers.pt \
 

@@ -179,6 +179,8 @@ class LocalArgs:
     coarse_aggregation: Literal["sum", "revisit_weighted_borda_image"] = "revisit_weighted_borda_image"
     segvlad_min_mask_area_ratio: float = 0.0
     segvlad_neighbor_order: int = 0
+    segvlad_centroid_pe_num_freqs: int = 4
+    segvlad_centroid_pe_weight: float = 0.2
     seg_cfg: SegmentorConfig = field(default_factory=SegmentorConfig)
 
 
@@ -374,6 +376,8 @@ def main(largs: LocalArgs):
         masks_cache_root=masks_cache_root,
         min_mask_area_ratio=largs.segvlad_min_mask_area_ratio,
         neighbor_order=largs.segvlad_neighbor_order,
+        centroid_pe_num_freqs=largs.segvlad_centroid_pe_num_freqs,
+        centroid_pe_weight=largs.segvlad_centroid_pe_weight,
         seg_cfg=seg_cfg_runtime,
         sam_generator=sam_generator,
     )
@@ -387,6 +391,8 @@ def main(largs: LocalArgs):
         masks_cache_root=masks_cache_root,
         min_mask_area_ratio=largs.segvlad_min_mask_area_ratio,
         neighbor_order=largs.segvlad_neighbor_order,
+        centroid_pe_num_freqs=largs.segvlad_centroid_pe_num_freqs,
+        centroid_pe_weight=largs.segvlad_centroid_pe_weight,
         seg_cfg=seg_cfg_runtime,
         sam_generator=sam_generator,
     )
@@ -476,6 +482,8 @@ def main(largs: LocalArgs):
         "Num-QU": str(len(qu_bank.indices)),
         "Num-DB-Segments": int(db_bank.segment_descs.shape[0]),
         "Num-QU-Segments": int(qu_bank.segment_descs.shape[0]),
+        "SegVLAD-Centroid-PE-Freqs": int(largs.segvlad_centroid_pe_num_freqs),
+        "SegVLAD-Centroid-PE-Weight": float(largs.segvlad_centroid_pe_weight),
         "Segment-TopK": int(largs.segment_top_k),
         "Coarse-Aggregation": str(largs.coarse_aggregation),
         "Coarse-TopK": str(largs.coarse_top_k),

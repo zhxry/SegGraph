@@ -146,11 +146,46 @@ def build_mask_adjacency(
     return adj_power > 0
 
 
+def mask_centroid_fourier_encoding(
+    mask_grid: torch.Tensor,
+    grid_hw: Tuple[int, int],
+    num_frequencies: int,
+) -> torch.Tensor:
+    if num_frequencies <= 0:
+        return torch.zeros((mask_grid.shape[0], 0), dtype=torch.float32)
+    if mask_grid.ndim != 2:
+        raise ValueError(f"mask_grid must be [num_segments, num_patches], got {tuple(mask_grid.shape)}")
+    grid_h, grid_w = grid_hw
+    if grid_h * grid_w != mask_grid.shape[1]:
+        raise ValueError(f"grid_hw {grid_hw} is incompatible with {mask_grid.shape[1]} patches")
+
+    mask_float = mask_grid.float()
+    ys = (torch.arange(grid_h, dtype=torch.float32) + 0.5).repeat_interleave(grid_w) / max(1, grid_h)
+    xs = (torch.arange(grid_w, dtype=torch.float32) + 0.5).repeat(grid_h) / max(1, grid_w)
+    denom = mask_float.sum(dim=1, keepdim=True).clamp_min(1.0)
+    centroids = torch.stack([
+        (mask_float * xs.unsqueeze(0)).sum(dim=1) / denom.squeeze(1),
+        (mask_float * ys.unsqueeze(0)).sum(dim=1) / denom.squeeze(1),
+    ], dim=1)
+
+    frequencies = (2.0 ** torch.arange(num_frequencies, dtype=torch.float32)) * torch.pi
+    angles = centroids.unsqueeze(-1) * frequencies.view(1, 1, -1)
+    return torch.cat([
+        torch.sin(angles[:, 0, :]),
+        torch.cos(angles[:, 0, :]),
+        torch.sin(angles[:, 1, :]),
+        torch.cos(angles[:, 1, :]),
+    ], dim=1)
+
+
 def segvlad_descriptors(
     patch_descs: torch.Tensor,
     c_centers: torch.Tensor,
     mask_grid: torch.Tensor,
     adjacency: Optional[torch.Tensor] = None,
+    grid_hw: Optional[Tuple[int, int]] = None,
+    centroid_pe_num_freqs: int = 0,
+    centroid_pe_weight: float = 0.0,
 ) -> torch.Tensor:
     if patch_descs.ndim != 2:
         raise ValueError(f"patch_descs must be [num_patches, desc_dim], got {tuple(patch_descs.shape)}")
@@ -181,7 +216,17 @@ def segvlad_descriptors(
         cluster_vlad = F.normalize(cluster_vlad, dim=1)
         vlads.append(cluster_vlad)
     stacked = torch.stack(vlads, dim=1).reshape(mask_grid.shape[0], -1)
-    return F.normalize(stacked, dim=1)
+    seg_descs = F.normalize(stacked, dim=1)
+    if centroid_pe_num_freqs > 0 and centroid_pe_weight > 0.0:
+        if grid_hw is None:
+            raise ValueError("grid_hw is required when centroid Fourier positional encoding is enabled")
+        centroid_pe = mask_centroid_fourier_encoding(
+            mask_grid,
+            grid_hw=grid_hw,
+            num_frequencies=centroid_pe_num_freqs,
+        )
+        seg_descs = torch.cat([seg_descs, float(centroid_pe_weight) * centroid_pe], dim=1)
+    return F.normalize(seg_descs, dim=1)
 
 
 def gem_pool_descriptors(
@@ -406,6 +451,8 @@ def build_segvlad_feature_bank(
     patch_stride: int = 14,
     min_mask_area_ratio: float = 0.0,
     neighbor_order: int = 0,
+    centroid_pe_num_freqs: int = 0,
+    centroid_pe_weight: float = 0.0,
     seg_cfg: Optional[SegmentorConfig] = None,
     sam_generator: Optional[SAMGenerator] = None,
     verbose: bool = True,
@@ -463,7 +510,15 @@ def build_segvlad_feature_bank(
             method=seg_cfg.neighbor_method,
         )
         local_flat = record.local_desc.reshape(-1, record.local_desc.shape[-1])
-        seg_descs = segvlad_descriptors(local_flat, vlad.c_centers, mask_grid, adjacency=adjacency)
+        seg_descs = segvlad_descriptors(
+            local_flat,
+            vlad.c_centers,
+            mask_grid,
+            adjacency=adjacency,
+            grid_hw=record.grid_hw,
+            centroid_pe_num_freqs=centroid_pe_num_freqs,
+            centroid_pe_weight=centroid_pe_weight,
+        )
 
         relpaths.append(dataset.get_image_relpaths(idx))
         all_locals.append(record.local_desc)

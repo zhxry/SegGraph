@@ -253,24 +253,37 @@ def _adjacency_from_delaunay(
         return None
     coords = []
     for mask in pixel_masks:
-        nz = torch.nonzero(mask, as_tuple=False).float()
-        if nz.numel() == 0:
+        mask_np = np.asarray(mask.detach().cpu().contiguous().numpy(), dtype=bool)
+        ys, xs = np.nonzero(mask_np)
+        if xs.size == 0:
             coords.append(np.array([0.0, 0.0], dtype=np.float32))
         else:
-            mean_yx = nz.mean(dim=0).cpu().numpy()
-            coords.append(np.array([mean_yx[1], mean_yx[0]], dtype=np.float32))
+            coords.append(np.array([xs.mean(), ys.mean()], dtype=np.float32))
     mask_coords = np.stack(coords, axis=0)
 
     adj = torch.zeros((num_masks, num_masks), dtype=torch.bool)
-    if num_masks > 3:
-        tri = Delaunay(mask_coords)
-        for simplex in tri.simplices:
-            for i in simplex:
-                adj[i, simplex] = True
-    else:
-        nbr_list = [0, 1] if num_masks > 1 else [0]
+    unique_coords = np.unique(mask_coords, axis=0)
+    centered = mask_coords - mask_coords.mean(axis=0, keepdims=True)
+    can_use_delaunay = (
+        num_masks > 3
+        and unique_coords.shape[0] >= 3
+        and np.linalg.matrix_rank(centered) >= 2
+    )
+    if can_use_delaunay:
+        try:
+            tri = Delaunay(mask_coords, qhull_options="QJ")
+            for simplex in tri.simplices:
+                for i in simplex:
+                    adj[i, simplex] = True
+        except Exception:
+            can_use_delaunay = False
+    if not can_use_delaunay:
+        k = min(4, num_masks)
+        coord_tensor = torch.as_tensor(mask_coords, dtype=torch.float32)
+        dists = torch.cdist(coord_tensor, coord_tensor)
+        knn = dists.topk(k=k, largest=False).indices
         for i in range(num_masks):
-            adj[i, nbr_list] = True
+            adj[i, knn[i]] = True
     adj = adj | adj.T
     adj.fill_diagonal_(True)
     adj_power = adj.float()

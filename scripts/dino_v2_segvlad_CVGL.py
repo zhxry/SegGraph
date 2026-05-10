@@ -64,6 +64,7 @@ from cvgl_retrieval import (
     coarse_retrieve_topk_segvlad,
     fit_vlad_for_dataset,
     predict_top1_offsets,
+    predict_top1_offsets_sliding_ncc,
     rerank_with_local_features,
 )
 from segvlad_masking import SAMGenerator, SegmentorConfig
@@ -162,13 +163,13 @@ class LocalArgs:
         skips fitting clusters on the current database split.
     """
     cache_dense_features: bool = True
-    use_local_rerank: bool = True
+    use_local_rerank: bool = False
     coarse_top_k: int = 10
     local_match_method: Literal["cosine_pool", "mutual_nn", "sim_map"] = "sim_map"
     rerank_alpha: float = 0.5
     local_top_m: int = 32
     use_offset_head: bool = True
-    offset_prediction_method: Literal["none", "sim_map"] = "sim_map"
+    offset_prediction_method: Literal["none", "sim_map", "slide_ncc"] = "slide_ncc"
     tile_size_m: Union[float, None] = None
     tile_size_px: Union[int, None] = None
     localization_thresholds: List[float] = field(default_factory=lambda: [1.0, 5.0, 10.0])
@@ -179,8 +180,12 @@ class LocalArgs:
     coarse_aggregation: Literal["sum", "revisit_weighted_borda_image"] = "revisit_weighted_borda_image"
     segvlad_min_mask_area_ratio: float = 0.0
     segvlad_neighbor_order: int = 0
-    segvlad_centroid_pe_num_freqs: int = 4
+    segvlad_centroid_pe_num_freqs: int = 0
     segvlad_centroid_pe_weight: float = 0.2
+    segvlad_relative_context_num_freqs: int = 0
+    segvlad_relative_context_weight: float = 0.0
+    segvlad_relative_context_order: int = 1
+    segvlad_relative_context_ref_grid_size: float = 0.0
     seg_cfg: SegmentorConfig = field(default_factory=SegmentorConfig)
 
 
@@ -365,6 +370,12 @@ def main(largs: LocalArgs):
         pretrained_vlad_cache_root=pretrained_vlad_cache_root,
         seg_cfg_runtime=seg_cfg_runtime,
     )
+    relative_context_ref_grid_hw = None
+    if largs.segvlad_relative_context_ref_grid_size > 0.0:
+        relative_context_ref_grid_hw = (
+            float(largs.segvlad_relative_context_ref_grid_size),
+            float(largs.segvlad_relative_context_ref_grid_size),
+        )
 
     db_bank = build_segvlad_feature_bank(
         dataset,
@@ -378,6 +389,10 @@ def main(largs: LocalArgs):
         neighbor_order=largs.segvlad_neighbor_order,
         centroid_pe_num_freqs=largs.segvlad_centroid_pe_num_freqs,
         centroid_pe_weight=largs.segvlad_centroid_pe_weight,
+        relative_context_num_freqs=largs.segvlad_relative_context_num_freqs,
+        relative_context_weight=largs.segvlad_relative_context_weight,
+        relative_context_order=largs.segvlad_relative_context_order,
+        relative_context_ref_grid_hw=relative_context_ref_grid_hw,
         seg_cfg=seg_cfg_runtime,
         sam_generator=sam_generator,
     )
@@ -393,6 +408,10 @@ def main(largs: LocalArgs):
         neighbor_order=largs.segvlad_neighbor_order,
         centroid_pe_num_freqs=largs.segvlad_centroid_pe_num_freqs,
         centroid_pe_weight=largs.segvlad_centroid_pe_weight,
+        relative_context_num_freqs=largs.segvlad_relative_context_num_freqs,
+        relative_context_weight=largs.segvlad_relative_context_weight,
+        relative_context_order=largs.segvlad_relative_context_order,
+        relative_context_ref_grid_hw=relative_context_ref_grid_hw,
         seg_cfg=seg_cfg_runtime,
         sam_generator=sam_generator,
     )
@@ -441,16 +460,28 @@ def main(largs: LocalArgs):
         tile_extent_default = (float(largs.tile_size_m), float(largs.tile_size_m))
     elif largs.tile_size_px is not None:
         tile_extent_default = (float(largs.tile_size_px), float(largs.tile_size_px))
-    if largs.use_offset_head and largs.offset_prediction_method == "sim_map":
-        pred_offsets, sim_maps = predict_top1_offsets(
-            dataset,
-            retrieval_indices,
-            db_bank=db_bank,
-            query_bank=qu_bank,
-            tile_extent_default=tile_extent_default,
-            local_top_m=largs.local_top_m,
-            query_indices=sampled_query_indices,
-        )
+    if largs.use_offset_head and largs.offset_prediction_method != "none":
+        if largs.offset_prediction_method == "sim_map":
+            pred_offsets, sim_maps = predict_top1_offsets(
+                dataset,
+                retrieval_indices,
+                db_bank=db_bank,
+                query_bank=qu_bank,
+                tile_extent_default=tile_extent_default,
+                local_top_m=largs.local_top_m,
+                query_indices=sampled_query_indices,
+            )
+        elif largs.offset_prediction_method == "slide_ncc":
+            pred_offsets, sim_maps = predict_top1_offsets_sliding_ncc(
+                dataset,
+                retrieval_indices,
+                db_bank=db_bank,
+                query_bank=qu_bank,
+                tile_extent_default=tile_extent_default,
+                query_indices=sampled_query_indices,
+            )
+        else:
+            raise ValueError(f"Unknown offset prediction method: {largs.offset_prediction_method}")
         gt_offsets = [dataset.get_query_gt_offset(qi) for qi in sampled_query_indices]
         offset_metrics = evaluate_offset_predictions(
             pred_offsets,
@@ -484,6 +515,10 @@ def main(largs: LocalArgs):
         "Num-QU-Segments": int(qu_bank.segment_descs.shape[0]),
         "SegVLAD-Centroid-PE-Freqs": int(largs.segvlad_centroid_pe_num_freqs),
         "SegVLAD-Centroid-PE-Weight": float(largs.segvlad_centroid_pe_weight),
+        "SegVLAD-Relative-Context-Freqs": int(largs.segvlad_relative_context_num_freqs),
+        "SegVLAD-Relative-Context-Weight": float(largs.segvlad_relative_context_weight),
+        "SegVLAD-Relative-Context-Order": int(largs.segvlad_relative_context_order),
+        "SegVLAD-Relative-Context-Ref-Grid-Size": float(largs.segvlad_relative_context_ref_grid_size),
         "Segment-TopK": int(largs.segment_top_k),
         "Coarse-Aggregation": str(largs.coarse_aggregation),
         "Coarse-TopK": str(largs.coarse_top_k),

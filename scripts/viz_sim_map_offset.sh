@@ -1,0 +1,11 @@
+CUDA_VISIBLE_DEVICES=0 python scripts/viz_sim_map_offset.py \
+    --cvgl-dataset-root data/Hawaii_wildfire_2023_1_336_intile \
+    --results-json .cache/experiments/cvgl_segvlad_run/cvgl_results_2026_04_28_07_39_25.json \
+    --output-dir .cache/sim_map_viz \
+    --tile-source gt \
+    --only-top1-correct \
+    --tile-size-px 512 \
+    --model-type dinov2_vitg14 \
+    --desc-layer 23 \
+    --desc-facet key \
+    --local-top-m 32

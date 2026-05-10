@@ -4,6 +4,7 @@
 """
 
 import os
+import sys
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple, Union
 
@@ -178,6 +179,77 @@ def mask_centroid_fourier_encoding(
     ], dim=1)
 
 
+def _mask_centroids_on_grid(
+    mask_grid: torch.Tensor,
+    grid_hw: Tuple[int, int],
+) -> torch.Tensor:
+    if mask_grid.ndim != 2:
+        raise ValueError(f"mask_grid must be [num_segments, num_patches], got {tuple(mask_grid.shape)}")
+    grid_h, grid_w = grid_hw
+    if grid_h * grid_w != mask_grid.shape[1]:
+        raise ValueError(f"grid_hw {grid_hw} is incompatible with {mask_grid.shape[1]} patches")
+
+    mask_float = mask_grid.float()
+    ys = torch.arange(grid_h, dtype=torch.float32).repeat_interleave(grid_w) + 0.5
+    xs = torch.arange(grid_w, dtype=torch.float32).repeat(grid_h) + 0.5
+    denom = mask_float.sum(dim=1, keepdim=True).clamp_min(1.0)
+    return torch.stack([
+        (mask_float * xs.unsqueeze(0)).sum(dim=1) / denom.squeeze(1),
+        (mask_float * ys.unsqueeze(0)).sum(dim=1) / denom.squeeze(1),
+    ], dim=1)
+
+
+def relative_neighbor_context_encoding(
+    mask_grid: torch.Tensor,
+    grid_hw: Tuple[int, int],
+    adjacency: Optional[torch.Tensor],
+    num_frequencies: int,
+    ref_grid_hw: Optional[Tuple[float, float]] = None,
+) -> torch.Tensor:
+    if num_frequencies <= 0:
+        return torch.zeros((mask_grid.shape[0], 0), dtype=torch.float32)
+    num_segments = mask_grid.shape[0]
+    if num_segments == 0:
+        return torch.zeros((0, 5 * 2 * num_frequencies), dtype=torch.float32)
+
+    if adjacency is None:
+        neighbor_mask = torch.eye(num_segments, dtype=torch.bool)
+    else:
+        neighbor_mask = adjacency.bool().clone()
+    if neighbor_mask.shape != (num_segments, num_segments):
+        raise ValueError(
+            f"adjacency must be [{num_segments}, {num_segments}], got {tuple(neighbor_mask.shape)}"
+        )
+    neighbor_mask.fill_diagonal_(False)
+
+    centroids = _mask_centroids_on_grid(mask_grid, grid_hw=grid_hw)
+    rel = centroids.unsqueeze(0) - centroids.unsqueeze(1)
+    if ref_grid_hw is None:
+        ref_h, ref_w = float(grid_hw[0]), float(grid_hw[1])
+    else:
+        ref_h, ref_w = float(ref_grid_hw[0]), float(ref_grid_hw[1])
+    ref_h = max(1.0, ref_h)
+    ref_w = max(1.0, ref_w)
+    ref_diag = max(1.0, float(np.hypot(ref_w, ref_h)))
+
+    dx = rel[:, :, 0] / ref_w
+    dy = rel[:, :, 1] / ref_h
+    dist = torch.sqrt(rel[:, :, 0] ** 2 + rel[:, :, 1] ** 2) / ref_diag
+    angle = torch.atan2(rel[:, :, 1], rel[:, :, 0])
+    geom = torch.stack([dx, dy, dist, torch.sin(angle), torch.cos(angle)], dim=2)
+
+    frequencies = (2.0 ** torch.arange(num_frequencies, dtype=torch.float32)) * torch.pi
+    angles = geom.unsqueeze(-1) * frequencies.view(1, 1, 1, -1)
+    edge_pe = torch.cat([torch.sin(angles), torch.cos(angles)], dim=3).reshape(
+        num_segments,
+        num_segments,
+        -1,
+    )
+    weights = neighbor_mask.float()
+    denom = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+    return (weights.unsqueeze(-1) * edge_pe).sum(dim=1) / denom
+
+
 def segvlad_descriptors(
     patch_descs: torch.Tensor,
     c_centers: torch.Tensor,
@@ -186,6 +258,10 @@ def segvlad_descriptors(
     grid_hw: Optional[Tuple[int, int]] = None,
     centroid_pe_num_freqs: int = 0,
     centroid_pe_weight: float = 0.0,
+    relative_context_adjacency: Optional[torch.Tensor] = None,
+    relative_context_num_freqs: int = 0,
+    relative_context_weight: float = 0.0,
+    relative_context_ref_grid_hw: Optional[Tuple[float, float]] = None,
 ) -> torch.Tensor:
     if patch_descs.ndim != 2:
         raise ValueError(f"patch_descs must be [num_patches, desc_dim], got {tuple(patch_descs.shape)}")
@@ -226,6 +302,17 @@ def segvlad_descriptors(
             num_frequencies=centroid_pe_num_freqs,
         )
         seg_descs = torch.cat([seg_descs, float(centroid_pe_weight) * centroid_pe], dim=1)
+    if relative_context_num_freqs > 0 and relative_context_weight > 0.0:
+        if grid_hw is None:
+            raise ValueError("grid_hw is required when relative neighbor context is enabled")
+        rel_context = relative_neighbor_context_encoding(
+            mask_grid,
+            grid_hw=grid_hw,
+            adjacency=relative_context_adjacency,
+            num_frequencies=relative_context_num_freqs,
+            ref_grid_hw=relative_context_ref_grid_hw,
+        )
+        seg_descs = torch.cat([seg_descs, float(relative_context_weight) * rel_context], dim=1)
     return F.normalize(seg_descs, dim=1)
 
 
@@ -368,7 +455,7 @@ def fit_vlad_for_dataset(
         return vlad
     train_descs = []
     fit_indices = list(db_indices)[::sub_sample_db_vlad]
-    iterator = tqdm(fit_indices, disable=not verbose, desc="VLAD clusters")
+    iterator = tqdm(fit_indices, disable=(not verbose) or (not sys.stderr.isatty()), desc="VLAD clusters")
     for idx in iterator:
         record = load_or_extract_record(
             dataset, idx, dino=dino, device=device,
@@ -402,7 +489,7 @@ def build_feature_bank(
     image_hws = []
     cropped_hws = []
     relpaths = []
-    iterator = tqdm(indices, disable=not verbose, desc="Dense features")
+    iterator = tqdm(indices, disable=(not verbose) or (not sys.stderr.isatty()), desc="Dense features")
     for idx in iterator:
         record = load_or_extract_record(
             dataset, idx, dino=dino, device=device,
@@ -453,6 +540,10 @@ def build_segvlad_feature_bank(
     neighbor_order: int = 0,
     centroid_pe_num_freqs: int = 0,
     centroid_pe_weight: float = 0.0,
+    relative_context_num_freqs: int = 0,
+    relative_context_weight: float = 0.0,
+    relative_context_order: int = 1,
+    relative_context_ref_grid_hw: Optional[Tuple[float, float]] = None,
     seg_cfg: Optional[SegmentorConfig] = None,
     sam_generator: Optional[SAMGenerator] = None,
     verbose: bool = True,
@@ -481,7 +572,7 @@ def build_segvlad_feature_bank(
     flat_segment_descs = []
     segment_to_image = []
     segment_to_image_pos = []
-    iterator = tqdm(indices, disable=not verbose, desc="SegVLAD features")
+    iterator = tqdm(indices, disable=(not verbose) or (not sys.stderr.isatty()), desc="SegVLAD features")
     for image_pos, idx in enumerate(iterator):
         record = load_or_extract_record(
             dataset, idx, dino=dino, device=device,
@@ -509,6 +600,15 @@ def build_segvlad_feature_bank(
             order=neighbor_order,
             method=seg_cfg.neighbor_method,
         )
+        relative_context_adjacency = None
+        if relative_context_num_freqs > 0 and relative_context_weight > 0.0:
+            relative_context_adjacency = build_mask_adjacency_revisit(
+                mask_grid,
+                pixel_masks=pixel_masks,
+                grid_hw=record.grid_hw,
+                order=relative_context_order,
+                method=seg_cfg.neighbor_method,
+            )
         local_flat = record.local_desc.reshape(-1, record.local_desc.shape[-1])
         seg_descs = segvlad_descriptors(
             local_flat,
@@ -518,6 +618,10 @@ def build_segvlad_feature_bank(
             grid_hw=record.grid_hw,
             centroid_pe_num_freqs=centroid_pe_num_freqs,
             centroid_pe_weight=centroid_pe_weight,
+            relative_context_adjacency=relative_context_adjacency,
+            relative_context_num_freqs=relative_context_num_freqs,
+            relative_context_weight=relative_context_weight,
+            relative_context_ref_grid_hw=relative_context_ref_grid_hw,
         )
 
         relpaths.append(dataset.get_image_relpaths(idx))
@@ -555,12 +659,18 @@ def coarse_retrieve_topk_segvlad(
     top_k: int,
     segment_top_k: int = 100,
     aggregation: Literal["sum", "revisit_weighted_borda_image"] = "revisit_weighted_borda_image",
+    verbose: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     db_segments = F.normalize(db_bank.segment_descs.float(), dim=1)
     num_images = len(db_bank.indices)
     score_rows = []
     index_rows = []
-    for q_segments_raw in query_bank.image_segment_descs:
+    iterator = tqdm(
+        query_bank.image_segment_descs,
+        disable=(not verbose) or (not sys.stderr.isatty()),
+        desc="SegVLAD coarse retrieval",
+    )
+    for q_segments_raw in iterator:
         q_segments = F.normalize(q_segments_raw.float(), dim=1)
         sims = q_segments @ db_segments.T
         seg_k = min(int(segment_top_k), sims.shape[1])
@@ -659,11 +769,17 @@ def rerank_with_local_features(
     local_match_method: Literal["cosine_pool", "mutual_nn", "sim_map"] = "sim_map",
     rerank_alpha: float = 0.5,
     local_top_m: int = 32,
+    verbose: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, List[List[float]]]:
     reranked_indices = []
     reranked_scores = []
     local_score_table: List[List[float]] = []
-    for qi in range(len(query_bank.indices)):
+    iterator = tqdm(
+        range(len(query_bank.indices)),
+        disable=(not verbose) or (not sys.stderr.isatty()),
+        desc="Local rerank",
+    )
+    for qi in iterator:
         candidates = coarse_indices[qi]
         combined = []
         candidate_local_scores = []
@@ -714,6 +830,70 @@ def estimate_offset_from_similarity_map(
     return (exp_x * scale_x, exp_y * scale_y), sim_map
 
 
+def compute_sliding_window_ncc_map(
+    query_local_desc: torch.Tensor,
+    tile_local_desc: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    if query_local_desc.ndim != 3 or tile_local_desc.ndim != 3:
+        raise ValueError("query_local_desc and tile_local_desc must be [H, W, D]")
+    q_h, q_w, q_d = query_local_desc.shape
+    t_h, t_w, t_d = tile_local_desc.shape
+    if q_d != t_d:
+        raise ValueError(f"Descriptor dim mismatch: query {q_d} vs tile {t_d}")
+    if q_h > t_h or q_w > t_w:
+        raise ValueError(
+            f"Query grid {(q_h, q_w)} must not exceed tile grid {(t_h, t_w)} for sliding NCC"
+        )
+
+    query = F.normalize(query_local_desc.float(), dim=-1).permute(2, 0, 1).unsqueeze(0)
+    tile = F.normalize(tile_local_desc.float(), dim=-1).permute(2, 0, 1).unsqueeze(0)
+    numel = float(query.numel())
+
+    query_centered = query - query.mean()
+    query_norm = query_centered.pow(2).sum().sqrt().clamp_min(eps)
+    dot = F.conv2d(tile, query_centered).squeeze(0).squeeze(0)
+
+    ones = torch.ones(
+        (1, tile.shape[1], q_h, q_w),
+        dtype=tile.dtype,
+        device=tile.device,
+    )
+    window_sum = F.conv2d(tile, ones).squeeze(0).squeeze(0)
+    window_sq_sum = F.conv2d(tile.pow(2), ones).squeeze(0).squeeze(0)
+    window_var_sum = (window_sq_sum - window_sum.pow(2) / numel).clamp_min(eps)
+    return dot / (query_norm * window_var_sum.sqrt())
+
+
+def estimate_offset_from_sliding_window_ncc(
+    query_local_desc: torch.Tensor,
+    tile_local_desc: torch.Tensor,
+    tile_extent: Optional[Union[float, Tuple[float, float]]] = None,
+) -> Tuple[Tuple[float, float], torch.Tensor]:
+    score_map = compute_sliding_window_ncc_map(query_local_desc, tile_local_desc)
+    q_h, q_w = query_local_desc.shape[:2]
+    t_h, t_w = tile_local_desc.shape[:2]
+    best_flat = int(torch.argmax(score_map.reshape(-1)).item())
+    best_y = best_flat // score_map.shape[1]
+    best_x = best_flat % score_map.shape[1]
+
+    center_x = float(best_x) + (float(q_w) - 1.0) / 2.0
+    center_y = float(best_y) + (float(q_h) - 1.0) / 2.0
+    norm_x = (center_x + 0.5) / float(t_w) - 0.5
+    norm_y = (center_y + 0.5) / float(t_h) - 0.5
+
+    if tile_extent is None:
+        scale_x = float(t_w)
+        scale_y = float(t_h)
+    elif isinstance(tile_extent, (int, float)):
+        scale_x = float(tile_extent)
+        scale_y = float(tile_extent)
+    else:
+        scale_x = float(tile_extent[0])
+        scale_y = float(tile_extent[1])
+    return (norm_x * scale_x, norm_y * scale_y), score_map
+
+
 def predict_top1_offsets(
     dataset,
     retrieval_indices: np.ndarray,
@@ -722,12 +902,19 @@ def predict_top1_offsets(
     tile_extent_default: Optional[Union[float, Tuple[float, float]]] = None,
     local_top_m: int = 32,
     query_indices: Optional[Sequence[int]] = None,
+    verbose: bool = True,
 ) -> Tuple[List[Optional[Tuple[float, float]]], List[Optional[torch.Tensor]]]:
     pred_offsets: List[Optional[Tuple[float, float]]] = []
     sim_maps: List[Optional[torch.Tensor]] = []
     if query_indices is None:
         query_indices = list(range(len(query_bank.indices)))
-    for qi, dataset_qi in enumerate(query_indices):
+    iterator = tqdm(
+        enumerate(query_indices),
+        total=len(query_indices),
+        disable=(not verbose) or (not sys.stderr.isatty()),
+        desc="Offset sim_map",
+    )
+    for qi, dataset_qi in iterator:
         top1_db_idx = int(retrieval_indices[qi, 0])
         dataset_db_idx = int(db_bank.indices[top1_db_idx])
         tile_extent = dataset.get_tile_extent(dataset_db_idx)
@@ -742,3 +929,38 @@ def predict_top1_offsets(
         pred_offsets.append(pred_offset)
         sim_maps.append(sim_map)
     return pred_offsets, sim_maps
+
+
+def predict_top1_offsets_sliding_ncc(
+    dataset,
+    retrieval_indices: np.ndarray,
+    db_bank: FeatureBank,
+    query_bank: FeatureBank,
+    tile_extent_default: Optional[Union[float, Tuple[float, float]]] = None,
+    query_indices: Optional[Sequence[int]] = None,
+    verbose: bool = True,
+) -> Tuple[List[Optional[Tuple[float, float]]], List[Optional[torch.Tensor]]]:
+    pred_offsets: List[Optional[Tuple[float, float]]] = []
+    score_maps: List[Optional[torch.Tensor]] = []
+    if query_indices is None:
+        query_indices = list(range(len(query_bank.indices)))
+    iterator = tqdm(
+        enumerate(query_indices),
+        total=len(query_indices),
+        disable=(not verbose) or (not sys.stderr.isatty()),
+        desc="Offset slide_ncc",
+    )
+    for qi, dataset_qi in iterator:
+        top1_db_idx = int(retrieval_indices[qi, 0])
+        dataset_db_idx = int(db_bank.indices[top1_db_idx])
+        tile_extent = dataset.get_tile_extent(dataset_db_idx)
+        if tile_extent is None:
+            tile_extent = tile_extent_default
+        pred_offset, score_map = estimate_offset_from_sliding_window_ncc(
+            query_bank.local_descs[qi],
+            db_bank.local_descs[top1_db_idx],
+            tile_extent=tile_extent,
+        )
+        pred_offsets.append(pred_offset)
+        score_maps.append(score_map)
+    return pred_offsets, score_maps

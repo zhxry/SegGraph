@@ -195,11 +195,12 @@ def project_masks_to_patch_grid(
     cropped_masks = mask_tensor[:, top:top + crop_h, left:left + crop_w] > 0.5
 
     flat = cropped_masks.reshape(cropped_masks.shape[0], -1)
-    patch_map = _pixel_to_patch_index(cropped_hw, grid_hw)
-    patch_masks = torch.zeros((flat.shape[0], grid_hw[0] * grid_hw[1]), dtype=torch.bool)
-    nz = torch.nonzero(flat, as_tuple=False)
-    if nz.numel() > 0:
-        patch_masks[nz[:, 0], patch_map[nz[:, 1]]] = True
+    patch_map = _pixel_to_patch_index(cropped_hw, grid_hw).to(device=flat.device)
+    num_patches = grid_hw[0] * grid_hw[1]
+    patch_masks = torch.zeros((flat.shape[0], num_patches), dtype=torch.bool, device=flat.device)
+    if flat.numel() > 0:
+        patch_indices = patch_map.unsqueeze(0).expand(flat.shape[0], -1)
+        patch_masks.scatter_reduce_(1, patch_indices, flat, reduce="amax", include_self=True)
 
     keep = patch_masks.any(dim=1)
     if min_area_ratio > 0.0:

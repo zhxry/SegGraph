@@ -178,6 +178,9 @@ class LocalArgs:
     cvgl_queries_manifest: Union[str, None] = None
     segment_top_k: int = 100
     coarse_aggregation: Literal["sum", "revisit_weighted_borda_image"] = "revisit_weighted_borda_image"
+    coarse_device: str = "auto"
+    coarse_db_segment_chunk_size: int = 0
+    coarse_query_batch_size: int = 16
     segvlad_min_mask_area_ratio: float = 0.0
     segvlad_neighbor_order: int = 0
     segvlad_centroid_pe_num_freqs: int = 0
@@ -423,6 +426,9 @@ def main(largs: LocalArgs):
         top_k=max(max(largs.top_k_vals), largs.coarse_top_k),
         segment_top_k=largs.segment_top_k,
         aggregation=largs.coarse_aggregation,
+        device=device if largs.coarse_device == "auto" else largs.coarse_device,
+        db_segment_chunk_size=largs.coarse_db_segment_chunk_size,
+        query_batch_size=largs.coarse_query_batch_size,
     )
     gt_db_indices = _collect_gt_db_indices(dataset, db_indices, qu_indices)
     coarse_metrics = evaluate_cvgl_retrieval(

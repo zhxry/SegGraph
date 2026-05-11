@@ -659,36 +659,65 @@ def coarse_retrieve_topk_segvlad(
     top_k: int,
     segment_top_k: int = 100,
     aggregation: Literal["sum", "revisit_weighted_borda_image"] = "revisit_weighted_borda_image",
+    device: Optional[Union[str, torch.device]] = None,
+    db_segment_chunk_size: int = 0,
+    query_batch_size: int = 16,
     verbose: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     db_segments = F.normalize(db_bank.segment_descs.float(), dim=1)
     num_images = len(db_bank.indices)
-    score_rows = []
-    index_rows = []
-    iterator = tqdm(
-        query_bank.image_segment_descs,
-        disable=(not verbose) or (not sys.stderr.isatty()),
-        desc="SegVLAD coarse retrieval",
-    )
-    for q_segments_raw in iterator:
-        q_segments = F.normalize(q_segments_raw.float(), dim=1)
-        sims = q_segments @ db_segments.T
-        seg_k = min(int(segment_top_k), sims.shape[1])
-        top_scores, top_indices = torch.topk(sims, k=seg_k, dim=1)
-        image_scores = torch.zeros(num_images, dtype=torch.float32)
+    if device is None:
+        retrieval_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        retrieval_device = torch.device(device)
+    if retrieval_device.type == "cuda" and not torch.cuda.is_available():
+        retrieval_device = torch.device("cpu")
+    db_segment_chunk_size = int(db_segment_chunk_size)
+    query_batch_size = max(1, int(query_batch_size))
+
+    def _cuda_memory_budget() -> int:
+        if retrieval_device.type != "cuda":
+            return 0
+        device_index = retrieval_device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+        reserve_bytes = max(1 << 30, int(0.15 * total_bytes))
+        return max(0, int(0.70 * max(0, free_bytes - reserve_bytes)))
+
+    def _choose_dynamic_chunk(num_query_segments: int) -> int:
+        if db_segment_chunk_size > 0 or retrieval_device.type != "cuda":
+            return max(1, db_segment_chunk_size)
+        budget = _cuda_memory_budget()
+        if budget <= 0:
+            return 1024
+        bytes_per_value = db_segments.element_size()
+        desc_dim = int(db_segments.shape[1])
+        # Account for the DB chunk, similarity matrix, and matmul/topk workspace.
+        bytes_per_db_segment = bytes_per_value * (desc_dim + 3 * max(1, num_query_segments))
+        chunk = max(1, budget // max(1, bytes_per_db_segment))
+        chunk = min(int(db_segments.shape[0]), int(chunk))
+        return max(256, (chunk // 256) * 256)
+
+    def _aggregate_image_scores(
+        top_scores: torch.Tensor,
+        top_indices: torch.Tensor,
+        num_query_segments: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        image_scores = torch.zeros(num_images, dtype=torch.float32, device=retrieval_device)
         if aggregation == "sum":
             image_scores.index_add_(
                 0,
-                db_bank.segment_to_image_pos[top_indices.reshape(-1)],
+                segment_to_image_pos[top_indices.reshape(-1)],
                 top_scores.reshape(-1),
             )
-            image_scores = image_scores / max(1, q_segments.shape[0])
+            image_scores = image_scores / max(1, num_query_segments)
         elif aggregation == "revisit_weighted_borda_image":
             sims_min = float(top_scores.min().item())
             sims_max = float(top_scores.max().item())
             denom = max(1e-12, sims_max - sims_min)
             norm_scores = (top_scores - sims_min) / denom
-            image_ids = db_bank.segment_to_image_pos[top_indices]
+            image_ids = segment_to_image_pos[top_indices]
             image_scores.index_add_(
                 0,
                 image_ids.reshape(-1),
@@ -697,9 +726,96 @@ def coarse_retrieve_topk_segvlad(
         else:
             raise ValueError(f"Unknown SegVLAD coarse aggregation: {aggregation}")
         img_k = min(int(top_k), num_images)
-        best_scores, best_indices = torch.topk(image_scores, k=img_k, dim=0)
-        score_rows.append(best_scores)
-        index_rows.append(best_indices)
+        return torch.topk(image_scores, k=img_k, dim=0)
+
+    db_segments_device = None
+    use_chunked_db = retrieval_device.type == "cuda" and db_segment_chunk_size > 0
+    if not use_chunked_db:
+        if retrieval_device.type == "cuda":
+            db_bytes = db_segments.numel() * db_segments.element_size()
+            if db_bytes > _cuda_memory_budget():
+                use_chunked_db = True
+        if not use_chunked_db:
+            try:
+                db_segments_device = db_segments.to(retrieval_device)
+            except RuntimeError as exc:
+                if retrieval_device.type != "cuda" or "out of memory" not in str(exc).lower():
+                    raise
+                torch.cuda.empty_cache()
+                use_chunked_db = True
+                if db_segment_chunk_size <= 0:
+                    db_segment_chunk_size = 4096
+                if verbose:
+                    print(
+                        "WARN: unable to keep all DB SegVLAD segments on CUDA; "
+                        f"falling back to chunks of {db_segment_chunk_size}: {exc}"
+                    )
+        if use_chunked_db and verbose:
+            chunk_msg = "dynamic" if db_segment_chunk_size <= 0 else str(db_segment_chunk_size)
+            print(
+                "WARN: DB SegVLAD segments do not fit in the CUDA memory budget; "
+                f"using chunked retrieval with chunk size {chunk_msg}."
+            )
+    segment_to_image_pos = db_bank.segment_to_image_pos.to(retrieval_device)
+    score_rows = []
+    index_rows = []
+    num_queries = len(query_bank.image_segment_descs)
+    iterator = tqdm(
+        range(0, num_queries, query_batch_size),
+        disable=(not verbose) or (not sys.stderr.isatty()),
+        desc="SegVLAD coarse retrieval",
+    )
+    for batch_start in iterator:
+        batch_raw = query_bank.image_segment_descs[batch_start:batch_start + query_batch_size]
+        q_counts = [int(q.shape[0]) for q in batch_raw]
+        q_segments = F.normalize(torch.cat([q.float() for q in batch_raw], dim=0), dim=1).to(retrieval_device)
+        seg_k = min(int(segment_top_k), db_segments.shape[0])
+        if use_chunked_db:
+            top_scores = None
+            top_indices = None
+            chunk_size = _choose_dynamic_chunk(q_segments.shape[0])
+            if verbose and hasattr(iterator, "set_postfix_str"):
+                iterator.set_postfix_str(f"chunk={chunk_size}")
+            start = 0
+            while start < db_segments.shape[0]:
+                end = min(start + chunk_size, db_segments.shape[0])
+                try:
+                    db_chunk = db_segments[start:end].to(retrieval_device)
+                    sims = q_segments @ db_chunk.T
+                except RuntimeError as exc:
+                    if retrieval_device.type != "cuda" or "out of memory" not in str(exc).lower() or chunk_size <= 256:
+                        raise
+                    torch.cuda.empty_cache()
+                    chunk_size = max(256, chunk_size // 2)
+                    if verbose and hasattr(iterator, "set_postfix_str"):
+                        iterator.set_postfix_str(f"chunk={chunk_size}")
+                    continue
+                chunk_k = min(seg_k, sims.shape[1])
+                chunk_scores, chunk_indices = torch.topk(sims, k=chunk_k, dim=1)
+                chunk_indices = chunk_indices + start
+                if top_scores is None:
+                    top_scores = chunk_scores
+                    top_indices = chunk_indices
+                else:
+                    merged_scores = torch.cat([top_scores, chunk_scores], dim=1)
+                    merged_indices = torch.cat([top_indices, chunk_indices], dim=1)
+                    top_scores, merged_pos = torch.topk(merged_scores, k=seg_k, dim=1)
+                    top_indices = torch.gather(merged_indices, 1, merged_pos)
+                start = end
+        else:
+            sims = q_segments @ db_segments_device.T
+            top_scores, top_indices = torch.topk(sims, k=seg_k, dim=1)
+
+        offset = 0
+        for count in q_counts:
+            best_scores, best_indices = _aggregate_image_scores(
+                top_scores[offset:offset + count],
+                top_indices[offset:offset + count],
+                count,
+            )
+            score_rows.append(best_scores)
+            index_rows.append(best_indices)
+            offset += count
     return (
         torch.stack(score_rows).cpu().numpy(),
         torch.stack(index_rows).cpu().numpy(),

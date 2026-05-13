@@ -1,17 +1,17 @@
-CUDA_VISIBLE_DEVICES=0 python scripts/dino_v2_vlad_CVGL.py \
+CUDA_VISIBLE_DEVICES=3 python scripts/dino_v2_vlad_CVGL.py \
     --prog.cache-dir .cache \
+    --exp-id cvgl_vlad_run \
     --task-mode cvgl \
-    --cvgl-dataset-root data/Turkey_earthquake_2023_1_336_intile \
+    --cvgl-dataset-root data/Hawaii_wildfire_2023_1_336_intile \
     --data-split test \
     --model-type dinov2_vitg14 \
     --global-agg vlad \
+    --vlad-assignment soft \
     --num-clusters 32 \
-    --desc-layer 31 \
+    --desc-layer 23 \
     --desc-facet key \
     --coarse-top-k 10 \
     --tile-size-px 512 \
-    --use-local-rerank \
-    --local-match-method sim_map \
+    --no-use-local-rerank \
     --use-offset-head \
-    --offset-prediction-method sim_map \
-    --exp-id cvgl_baseline_run
+    --offset-prediction-method slide_ncc

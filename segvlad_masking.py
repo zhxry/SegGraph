@@ -18,6 +18,45 @@ from PIL import Image
 from scipy.spatial import Delaunay
 
 
+def _mask_to_rle_numpy(tensor: torch.Tensor) -> List[dict]:
+    """
+        NumPy-backed replacement for SAM's mask_to_rle_pytorch.
+        Avoids torch.nonzero, which can hit an internal PyTorch 2.1.x assert.
+    """
+    masks = tensor.detach().cpu().numpy().astype(bool)
+    if masks.ndim != 3:
+        raise ValueError(f"Expected mask tensor [B, H, W], got {masks.shape}")
+    _, height, width = masks.shape
+    rles = []
+    for mask in masks:
+        flat = mask.transpose(1, 0).reshape(-1)
+        if flat.size <= 1:
+            change_indices = np.empty((0,), dtype=np.int64)
+        else:
+            change_indices = np.flatnonzero(flat[1:] != flat[:-1]).astype(np.int64)
+        run_boundaries = np.concatenate((
+            np.array([0], dtype=np.int64),
+            change_indices + 1,
+            np.array([height * width], dtype=np.int64),
+        ))
+        counts = np.diff(run_boundaries).astype(np.int64).tolist()
+        if bool(flat[0]):
+            counts = [0] + counts
+        rles.append({"size": [height, width], "counts": counts})
+    return rles
+
+
+def _patch_sam_rle_encoder() -> None:
+    """
+        Patch SAM's RLE encoder in process memory without modifying site-packages.
+    """
+    import segment_anything.automatic_mask_generator as sam_amg
+    import segment_anything.utils.amg as sam_utils_amg
+
+    sam_utils_amg.mask_to_rle_pytorch = _mask_to_rle_numpy
+    sam_amg.mask_to_rle_pytorch = _mask_to_rle_numpy
+
+
 @dataclass
 class SegmentorConfig:
     source: Literal["manifest", "sam", "manifest_or_sam"] = "manifest_or_sam"
@@ -54,6 +93,7 @@ class SAMGenerator:
         if sam_pkg_root not in sys.path:
             sys.path.append(sam_pkg_root)
         from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
+        _patch_sam_rle_encoder()
 
         if device.startswith("cuda") and not torch.cuda.is_available():
             device = "cpu"

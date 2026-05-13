@@ -172,10 +172,11 @@ class LocalArgs:
     offset_prediction_method: Literal["none", "sim_map", "slide_ncc"] = "slide_ncc"
     tile_size_m: Union[float, None] = None
     tile_size_px: Union[int, None] = None
-    localization_thresholds: List[float] = field(default_factory=lambda: [1.0, 5.0, 10.0])
+    localization_thresholds: List[float] = field(default_factory=lambda: [16.0, 32.0, 64.0])
     cvgl_dataset_root: Union[str, None] = None
     cvgl_tiles_manifest: Union[str, None] = None
     cvgl_queries_manifest: Union[str, None] = None
+    segment_descriptor: Literal["segvlad", "sap"] = "segvlad"
     segment_top_k: int = 100
     coarse_aggregation: Literal["sum", "revisit_weighted_borda_image"] = "revisit_weighted_borda_image"
     coarse_device: str = "auto"
@@ -252,12 +253,14 @@ def _build_dense_cache_root(largs: LocalArgs):
         str(largs.prog.cache_dir),
         "cvgl_descs",
         dataset_cache_id,
-        f"{largs.model_type}-{largs.desc_facet}-L{largs.desc_layer}-segvlad",
+        f"{largs.model_type}-{largs.desc_facet}-L{largs.desc_layer}-{largs.segment_descriptor}",
     )
     dense_root = None
     if largs.cache_dense_features:
         dense_root = os.path.join(base_dir, "dense")
-    vlad_root = os.path.join(base_dir, f"vlad-C{largs.num_clusters}")
+    vlad_root = None
+    if largs.segment_descriptor == "segvlad":
+        vlad_root = os.path.join(base_dir, f"vlad-C{largs.num_clusters}")
     masks_root = None
     if largs.seg_cfg.cache_generated_masks:
         masks_root = os.path.join(base_dir, "sam_masks")
@@ -310,6 +313,8 @@ def main(largs: LocalArgs):
     dense_cache_root, vlad_cache_root, masks_cache_root = _build_dense_cache_root(largs)
     pretrained_vlad_cache_root = _resolve_pretrained_vlad_cache_root(largs)
     if pretrained_vlad_cache_root is not None:
+        if largs.segment_descriptor != "segvlad":
+            raise ValueError("pretrained_vlad_centers can only be used with segment_descriptor='segvlad'")
         vlad_cache_root = pretrained_vlad_cache_root
 
     wandb_run = None
@@ -338,18 +343,20 @@ def main(largs: LocalArgs):
     )
     sampled_query_indices = [int(idx - dataset.database_num) for idx in qu_indices.tolist()]
 
-    vlad = fit_vlad_for_dataset(
-        dataset,
-        db_indices=db_indices,
-        dino=dino,
-        device=device,
-        num_clusters=largs.num_clusters,
-        sub_sample_db_vlad=largs.sub_sample_db_vlad,
-        vlad_assignment=largs.vlad_assignment,
-        vlad_soft_temp=largs.vlad_soft_temp,
-        feature_cache_root=dense_cache_root,
-        vlad_cache_root=vlad_cache_root,
-    )
+    vlad = None
+    if largs.segment_descriptor == "segvlad":
+        vlad = fit_vlad_for_dataset(
+            dataset,
+            db_indices=db_indices,
+            dino=dino,
+            device=device,
+            num_clusters=largs.num_clusters,
+            sub_sample_db_vlad=largs.sub_sample_db_vlad,
+            vlad_assignment=largs.vlad_assignment,
+            vlad_soft_temp=largs.vlad_soft_temp,
+            feature_cache_root=dense_cache_root,
+            vlad_cache_root=vlad_cache_root,
+        )
     sam_generator = None
     seg_cfg_runtime = largs.seg_cfg
     if largs.seg_cfg.source in ["sam", "manifest_or_sam"]:
@@ -388,6 +395,7 @@ def main(largs: LocalArgs):
         vlad=vlad,
         feature_cache_root=dense_cache_root,
         masks_cache_root=masks_cache_root,
+        segment_descriptor=largs.segment_descriptor,
         min_mask_area_ratio=largs.segvlad_min_mask_area_ratio,
         neighbor_order=largs.segvlad_neighbor_order,
         centroid_pe_num_freqs=largs.segvlad_centroid_pe_num_freqs,
@@ -407,6 +415,7 @@ def main(largs: LocalArgs):
         vlad=vlad,
         feature_cache_root=dense_cache_root,
         masks_cache_root=masks_cache_root,
+        segment_descriptor=largs.segment_descriptor,
         min_mask_area_ratio=largs.segvlad_min_mask_area_ratio,
         neighbor_order=largs.segvlad_neighbor_order,
         centroid_pe_num_freqs=largs.segvlad_centroid_pe_num_freqs,
@@ -510,7 +519,8 @@ def main(largs: LocalArgs):
         "Desc-Facet": str(largs.desc_facet),
         "DB-Name": str(largs.prog.vg_dataset_name),
         "Task-Mode": str(largs.task_mode),
-        "Agg-Method": "SegVLAD",
+        "Agg-Method": "SegVLAD" if largs.segment_descriptor == "segvlad" else "SAP",
+        "Segment-Descriptor": str(largs.segment_descriptor),
         "Pretrained-VLAD-Centers": (
             None if largs.pretrained_vlad_centers is None
             else os.path.abspath(os.path.expanduser(str(largs.pretrained_vlad_centers)))

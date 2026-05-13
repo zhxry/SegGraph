@@ -1,0 +1,12 @@
+CUDA_VISIBLE_DEVICES=2 python scripts/backbone_ablation_CVGL.py \
+    --prog.cache-dir .cache/backbone_ablation \
+    --cvgl-dataset-root data/Hawaii_wildfire_2023_1_336_intile \
+    --backbone resnet50 \
+    --model-name ignored \
+    --desc-layer 6 \
+    --desc-facet token \
+    --agg-method vlad \
+    --global-agg gem \
+    --no-clip-use-projection \
+    --tile-size-px 512 \
+    --exp-id backbone_ablation

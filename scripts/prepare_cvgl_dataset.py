@@ -9,7 +9,9 @@
     output_root/
     ├── tiles/
     ├── queries/
+    ├── tile_post/          (optional)
     ├── tiles.json
+    ├── tile_post.json      (optional)
     └── queries.json
 """
 
@@ -185,6 +187,41 @@ def _compute_tile_id_and_offset(
     return tile_id, (dx, dy), (tile_center_x, tile_center_y), row, col
 
 
+def _save_grid_tiles(
+    image: Image.Image,
+    out_root: str,
+    rel_dir: str,
+    image_ext: str,
+    tile_hw: Tuple[int, int],
+    num_tile_rows: int,
+    num_tile_cols: int,
+) -> List[dict]:
+    tile_h, tile_w = tile_hw
+    os.makedirs(os.path.join(out_root, rel_dir), exist_ok=True)
+    manifest = []
+    for row in range(num_tile_rows):
+        for col in range(num_tile_cols):
+            left = col * tile_w
+            top = row * tile_h
+            right = left + tile_w
+            bottom = top + tile_h
+            tile_id = f"tile_r{row:02d}_c{col:02d}"
+            tile_img = image.crop((left, top, right, bottom))
+            tile_relpath = os.path.join(rel_dir, f"{tile_id}.{image_ext}")
+            tile_abspath = os.path.join(out_root, tile_relpath)
+            tile_img.save(tile_abspath)
+            manifest.append({
+                "tile_id": tile_id,
+                "image": tile_relpath,
+                "center": [float(left + tile_w / 2.0), float(top + tile_h / 2.0)],
+                "extent": [float(tile_w), float(tile_h)],
+                "row": row,
+                "col": col,
+                "bbox": [left, top, right, bottom],
+            })
+    return manifest
+
+
 @dataclass
 class LocalArgs:
     satellite_image_path: str
@@ -225,6 +262,16 @@ class LocalArgs:
         If True, sample query centers only from tile-local safe regions so
         every query crop is fully contained in one tile.
     """
+    save_post_tiles: bool = False
+    """
+        If True, split the UAV/post-disaster image into the same tile grid and
+        save the crops under `tile_post/`.
+    """
+    post_only: bool = False
+    """
+        If True, only generate `tile_post/` and `tile_post.json`. Existing
+        `tiles/`, `queries/`, `tiles.json`, and `queries.json` are not touched.
+    """
     save_visual_index: bool = False
     overwrite: bool = False
 
@@ -239,12 +286,19 @@ def main(largs: LocalArgs):
     query_hw = (int(largs.query_size), int(largs.query_size))
     support_hw = _rotation_support_hw(query_hw) if largs.rotate else query_hw
     rng = random.Random(int(largs.seed))
+    post_only = bool(largs.post_only)
+    save_post_tiles = bool(largs.save_post_tiles or post_only)
 
     if not os.path.isfile(sat_path):
         raise FileNotFoundError(f"Satellite image not found: {sat_path}")
     if not os.path.isfile(uav_path):
         raise FileNotFoundError(f"UAV image not found: {uav_path}")
-    if os.path.exists(out_root) and not largs.overwrite and os.listdir(out_root):
+    if (
+        os.path.exists(out_root)
+        and not largs.overwrite
+        and os.listdir(out_root)
+        and not post_only
+    ):
         raise FileExistsError(
             f"Output directory already exists and is not empty: {out_root}. "
             "Set `--overwrite true` or choose another directory."
@@ -252,8 +306,20 @@ def main(largs: LocalArgs):
     os.makedirs(out_root, exist_ok=True)
     tiles_dir = os.path.join(out_root, "tiles")
     queries_dir = os.path.join(out_root, "queries")
-    os.makedirs(tiles_dir, exist_ok=True)
-    os.makedirs(queries_dir, exist_ok=True)
+    post_tiles_dir = os.path.join(out_root, "tile_post")
+    post_tiles_manifest_path = os.path.join(out_root, "tile_post.json")
+    if post_only and not largs.overwrite:
+        if (
+            (os.path.isdir(post_tiles_dir) and os.listdir(post_tiles_dir))
+            or os.path.exists(post_tiles_manifest_path)
+        ):
+            raise FileExistsError(
+                f"Post tile outputs already exist under {out_root}. "
+                "Set `--overwrite true` to refresh `tile_post/` and `tile_post.json`."
+            )
+    if not post_only:
+        os.makedirs(tiles_dir, exist_ok=True)
+        os.makedirs(queries_dir, exist_ok=True)
 
     satellite_image = Image.open(sat_path).convert("RGB")
     uav_image = Image.open(uav_path).convert("RGB")
@@ -271,28 +337,41 @@ def main(largs: LocalArgs):
     num_tile_rows = canvas_h // tile_h
     num_tile_cols = canvas_w // tile_w
 
-    print("Preparing tiles...")
     tiles_manifest = []
-    for row in range(num_tile_rows):
-        for col in range(num_tile_cols):
-            left = col * tile_w
-            top = row * tile_h
-            right = left + tile_w
-            bottom = top + tile_h
-            tile_id = f"tile_r{row:02d}_c{col:02d}"
-            tile_img = satellite_image.crop((left, top, right, bottom))
-            tile_relpath = os.path.join("tiles", f"{tile_id}.{largs.image_ext}")
-            tile_abspath = os.path.join(out_root, tile_relpath)
-            tile_img.save(tile_abspath)
-            tiles_manifest.append({
-                "tile_id": tile_id,
-                "image": tile_relpath,
-                "center": [float(left + tile_w / 2.0), float(top + tile_h / 2.0)],
-                "extent": [float(tile_w), float(tile_h)],
-                "row": row,
-                "col": col,
-                "bbox": [left, top, right, bottom],
-            })
+    post_tiles_manifest = []
+    if not post_only:
+        print("Preparing tiles...")
+        tiles_manifest = _save_grid_tiles(
+            image=satellite_image,
+            out_root=out_root,
+            rel_dir="tiles",
+            image_ext=largs.image_ext,
+            tile_hw=tile_hw,
+            num_tile_rows=num_tile_rows,
+            num_tile_cols=num_tile_cols,
+        )
+
+    if save_post_tiles:
+        print("Preparing post-disaster tiles...")
+        post_tiles_manifest = _save_grid_tiles(
+            image=uav_image,
+            out_root=out_root,
+            rel_dir="tile_post",
+            image_ext=largs.image_ext,
+            tile_hw=tile_hw,
+            num_tile_rows=num_tile_rows,
+            num_tile_cols=num_tile_cols,
+        )
+
+    if post_only:
+        with open(post_tiles_manifest_path, "w", encoding="utf-8") as f:
+            json.dump(post_tiles_manifest, f, indent=2)
+        print("Done.")
+        print(f"- Output root: {out_root}")
+        print(f"- Post tiles: {len(post_tiles_manifest)}")
+        print(f"- Tile size: {tile_hw}")
+        print("- Post-only: True")
+        return
 
     print("Sampling UAV queries...")
     centers = _sample_query_centers(
@@ -344,6 +423,9 @@ def main(largs: LocalArgs):
 
     with open(os.path.join(out_root, "tiles.json"), "w", encoding="utf-8") as f:
         json.dump(tiles_manifest, f, indent=2)
+    if save_post_tiles:
+        with open(post_tiles_manifest_path, "w", encoding="utf-8") as f:
+            json.dump(post_tiles_manifest, f, indent=2)
     with open(os.path.join(out_root, "queries.json"), "w", encoding="utf-8") as f:
         json.dump(queries_manifest, f, indent=2)
 
@@ -357,7 +439,10 @@ def main(largs: LocalArgs):
             "support_size_hw": [support_hw[0], support_hw[1]],
             "rotate": bool(largs.rotate),
             "ensure_query_within_single_tile": bool(largs.ensure_query_within_single_tile),
+            "save_post_tiles": bool(save_post_tiles),
+            "post_only": bool(post_only),
             "num_tiles": len(tiles_manifest),
+            "num_post_tiles": len(post_tiles_manifest),
             "num_queries": len(queries_manifest),
             "seed": int(largs.seed),
         }
@@ -367,6 +452,8 @@ def main(largs: LocalArgs):
     print("Done.")
     print(f"- Output root: {out_root}")
     print(f"- Tiles: {len(tiles_manifest)}")
+    if save_post_tiles:
+        print(f"- Post tiles: {len(post_tiles_manifest)}")
     print(f"- Queries: {len(queries_manifest)}")
     print(f"- Tile size: {tile_hw}")
     print(f"- Query size: {query_hw}")

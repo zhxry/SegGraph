@@ -316,6 +316,57 @@ def segvlad_descriptors(
     return F.normalize(seg_descs, dim=1)
 
 
+def segment_average_descriptors(
+    patch_descs: torch.Tensor,
+    mask_grid: torch.Tensor,
+    adjacency: Optional[torch.Tensor] = None,
+    grid_hw: Optional[Tuple[int, int]] = None,
+    centroid_pe_num_freqs: int = 0,
+    centroid_pe_weight: float = 0.0,
+    relative_context_adjacency: Optional[torch.Tensor] = None,
+    relative_context_num_freqs: int = 0,
+    relative_context_weight: float = 0.0,
+    relative_context_ref_grid_hw: Optional[Tuple[float, float]] = None,
+) -> torch.Tensor:
+    if patch_descs.ndim != 2:
+        raise ValueError(f"patch_descs must be [num_patches, desc_dim], got {tuple(patch_descs.shape)}")
+    if mask_grid.ndim != 2:
+        raise ValueError(f"mask_grid must be [num_segments, num_patches], got {tuple(mask_grid.shape)}")
+    if patch_descs.shape[0] != mask_grid.shape[1]:
+        raise ValueError(
+            f"Patch/mask mismatch: {patch_descs.shape[0]} patches vs {mask_grid.shape[1]} mask entries"
+        )
+    if adjacency is None:
+        adjacency = torch.eye(mask_grid.shape[0], dtype=torch.bool)
+
+    descs = F.normalize(patch_descs.float(), dim=1)
+    segment_masks = (adjacency.float() @ mask_grid.float()) > 0
+    weights = segment_masks.float()
+    denom = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+    seg_descs = F.normalize((weights @ descs) / denom, dim=1)
+    if centroid_pe_num_freqs > 0 and centroid_pe_weight > 0.0:
+        if grid_hw is None:
+            raise ValueError("grid_hw is required when centroid Fourier positional encoding is enabled")
+        centroid_pe = mask_centroid_fourier_encoding(
+            mask_grid,
+            grid_hw=grid_hw,
+            num_frequencies=centroid_pe_num_freqs,
+        )
+        seg_descs = torch.cat([seg_descs, float(centroid_pe_weight) * centroid_pe], dim=1)
+    if relative_context_num_freqs > 0 and relative_context_weight > 0.0:
+        if grid_hw is None:
+            raise ValueError("grid_hw is required when relative neighbor context is enabled")
+        rel_context = relative_neighbor_context_encoding(
+            mask_grid,
+            grid_hw=grid_hw,
+            adjacency=relative_context_adjacency,
+            num_frequencies=relative_context_num_freqs,
+            ref_grid_hw=relative_context_ref_grid_hw,
+        )
+        seg_descs = torch.cat([seg_descs, float(relative_context_weight) * rel_context], dim=1)
+    return F.normalize(seg_descs, dim=1)
+
+
 def gem_pool_descriptors(
     patch_descs: torch.Tensor,
     gem_p: float = 3.0,
@@ -335,12 +386,45 @@ def gem_pool_descriptors(
     return torch.abs(x) * torch.sign(torch.real(torch.mean(patch_descs ** gem_p, dim=0)))
 
 
+def global_pool_descriptors(
+    patch_descs: torch.Tensor,
+    method: Literal["gap", "gmp"],
+) -> torch.Tensor:
+    if patch_descs.ndim != 2:
+        raise ValueError("patch_descs must have shape [num_patches, desc_dim]")
+    if method == "gap":
+        return patch_descs.mean(dim=0)
+    if method == "gmp":
+        return patch_descs.max(dim=0).values
+    raise ValueError(f"Unknown global pooling method: {method}")
+
+
+def _extract_patch_and_cls_descs(
+    img_in: torch.Tensor,
+    dino: DinoV2ExtractFeatures,
+    need_cls: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if not need_cls:
+        return dino(img_in)[0].detach().cpu(), None
+    if not hasattr(dino, "use_cls"):
+        raise ValueError("global_agg='cls' requires an extractor with a `use_cls` switch")
+    old_use_cls = bool(dino.use_cls)
+    dino.use_cls = True
+    try:
+        descs = dino(img_in)[0].detach().cpu()
+    finally:
+        dino.use_cls = old_use_cls
+    if descs.shape[0] < 2:
+        raise ValueError(f"Expected CLS + patch descriptors, got shape {tuple(descs.shape)}")
+    return descs[1:], descs[0]
+
+
 def extract_dense_record(
     img: torch.Tensor,
     dino: DinoV2ExtractFeatures,
     device: torch.device,
     patch_stride: int = 14,
-    global_agg: Literal["vlad", "gem"] = "vlad",
+    global_agg: Literal["vlad", "gem", "cls", "gap", "gmp"] = "vlad",
     gem_p: float = 3.0,
     gem_use_abs: bool = False,
     gem_elem_by_elem: bool = False,
@@ -352,7 +436,11 @@ def extract_dense_record(
     if h_new <= 0 or w_new <= 0:
         raise ValueError(f"Invalid cropped size {(h_new, w_new)} from input {(h, w)}")
     img_in = T.CenterCrop((h_new, w_new))(img)[None, ...].to(device)
-    patch_descs = dino(img_in)[0].detach().cpu()
+    patch_descs, cls_desc = _extract_patch_and_cls_descs(
+        img_in,
+        dino=dino,
+        need_cls=global_agg == "cls",
+    )
     grid_hw = (h_new // patch_stride, w_new // patch_stride)
     if patch_descs.shape[0] != grid_hw[0] * grid_hw[1]:
         raise ValueError(
@@ -367,6 +455,15 @@ def extract_dense_record(
                 gem_use_abs=gem_use_abs,
                 gem_elem_by_elem=gem_elem_by_elem,
             ),
+            dim=0,
+        )
+    elif global_agg == "cls":
+        if cls_desc is None:
+            raise ValueError("CLS descriptor was not extracted")
+        global_desc = F.normalize(cls_desc, dim=0)
+    elif global_agg in ["gap", "gmp"]:
+        global_desc = F.normalize(
+            global_pool_descriptors(patch_descs, method=global_agg),
             dim=0,
         )
     return DenseFeatureRecord(
@@ -392,7 +489,7 @@ def load_or_extract_record(
     dino: DinoV2ExtractFeatures,
     device: torch.device,
     cache_root: Optional[str] = None,
-    global_agg: Literal["vlad", "gem"] = "vlad",
+    global_agg: Literal["vlad", "gem", "cls", "gap", "gmp"] = "vlad",
     gem_p: float = 3.0,
     gem_use_abs: bool = False,
     gem_elem_by_elem: bool = False,
@@ -402,14 +499,15 @@ def load_or_extract_record(
     cache_path = _feature_cache_path(cache_root, relpath)
     if cache_path is not None and os.path.isfile(cache_path):
         payload = torch.load(cache_path)
-        return DenseFeatureRecord(
-            local_desc=payload["local_desc"],
-            grid_hw=tuple(payload["grid_hw"]),
-            image_hw=tuple(payload["image_hw"]),
-            cropped_hw=tuple(payload["cropped_hw"]),
-            patch_stride=int(payload["patch_stride"]),
-            global_desc=payload.get("global_desc"),
-        )
+        if global_agg == "vlad" or payload.get("global_desc") is not None:
+            return DenseFeatureRecord(
+                local_desc=payload["local_desc"],
+                grid_hw=tuple(payload["grid_hw"]),
+                image_hw=tuple(payload["image_hw"]),
+                cropped_hw=tuple(payload["cropped_hw"]),
+                patch_stride=int(payload["patch_stride"]),
+                global_desc=payload.get("global_desc"),
+            )
     img, _ = dataset[index]
     record = extract_dense_record(
         img, dino=dino, device=device, patch_stride=patch_stride,
@@ -474,7 +572,7 @@ def build_feature_bank(
     indices: Sequence[int],
     dino: DinoV2ExtractFeatures,
     device: torch.device,
-    global_agg: Literal["vlad", "gem"] = "vlad",
+    global_agg: Literal["vlad", "gem", "cls", "gap", "gmp"] = "vlad",
     vlad: Optional[VLAD] = None,
     feature_cache_root: Optional[str] = None,
     gem_p: float = 3.0,
@@ -506,7 +604,7 @@ def build_feature_bank(
         else:
             global_desc = record.global_desc
             if global_desc is None:
-                raise ValueError("GeM aggregation requested but global_desc is missing")
+                raise ValueError(f"{global_agg} aggregation requested but global_desc is missing")
         all_globals.append(F.normalize(global_desc, dim=0))
         all_locals.append(record.local_desc)
         grid_hws.append(record.grid_hw)
@@ -532,10 +630,11 @@ def build_segvlad_feature_bank(
     indices: Sequence[int],
     dino: DinoV2ExtractFeatures,
     device: torch.device,
-    vlad: VLAD,
+    vlad: Optional[VLAD],
     feature_cache_root: Optional[str] = None,
     masks_cache_root: Optional[str] = None,
     patch_stride: int = 14,
+    segment_descriptor: Literal["segvlad", "sap"] = "segvlad",
     min_mask_area_ratio: float = 0.0,
     neighbor_order: int = 0,
     centroid_pe_num_freqs: int = 0,
@@ -550,6 +649,8 @@ def build_segvlad_feature_bank(
 ) -> SegVLADFeatureBank:
     if seg_cfg is None:
         seg_cfg = SegmentorConfig()
+    if segment_descriptor == "segvlad" and vlad is None:
+        raise ValueError("segment_descriptor='segvlad' requires a fitted VLAD instance")
     if sam_generator is None and seg_cfg.source in ["sam", "manifest_or_sam"]:
         try:
             sam_generator = SAMGenerator(
@@ -608,21 +709,37 @@ def build_segvlad_feature_bank(
                 grid_hw=record.grid_hw,
                 order=relative_context_order,
                 method=seg_cfg.neighbor_method,
-            )
-        local_flat = record.local_desc.reshape(-1, record.local_desc.shape[-1])
-        seg_descs = segvlad_descriptors(
-            local_flat,
-            vlad.c_centers,
-            mask_grid,
-            adjacency=adjacency,
-            grid_hw=record.grid_hw,
-            centroid_pe_num_freqs=centroid_pe_num_freqs,
-            centroid_pe_weight=centroid_pe_weight,
-            relative_context_adjacency=relative_context_adjacency,
-            relative_context_num_freqs=relative_context_num_freqs,
-            relative_context_weight=relative_context_weight,
-            relative_context_ref_grid_hw=relative_context_ref_grid_hw,
         )
+        local_flat = record.local_desc.reshape(-1, record.local_desc.shape[-1])
+        if segment_descriptor == "segvlad":
+            seg_descs = segvlad_descriptors(
+                local_flat,
+                vlad.c_centers,
+                mask_grid,
+                adjacency=adjacency,
+                grid_hw=record.grid_hw,
+                centroid_pe_num_freqs=centroid_pe_num_freqs,
+                centroid_pe_weight=centroid_pe_weight,
+                relative_context_adjacency=relative_context_adjacency,
+                relative_context_num_freqs=relative_context_num_freqs,
+                relative_context_weight=relative_context_weight,
+                relative_context_ref_grid_hw=relative_context_ref_grid_hw,
+            )
+        elif segment_descriptor == "sap":
+            seg_descs = segment_average_descriptors(
+                local_flat,
+                mask_grid,
+                adjacency=adjacency,
+                grid_hw=record.grid_hw,
+                centroid_pe_num_freqs=centroid_pe_num_freqs,
+                centroid_pe_weight=centroid_pe_weight,
+                relative_context_adjacency=relative_context_adjacency,
+                relative_context_num_freqs=relative_context_num_freqs,
+                relative_context_weight=relative_context_weight,
+                relative_context_ref_grid_hw=relative_context_ref_grid_hw,
+            )
+        else:
+            raise ValueError(f"Unknown segment descriptor: {segment_descriptor}")
 
         relpaths.append(dataset.get_image_relpaths(idx))
         all_locals.append(record.local_desc)

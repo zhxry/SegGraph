@@ -2,7 +2,7 @@
 """
     Pipeline:
     - extract DINOv2 dense descriptors
-    - aggregate global descriptors with VLAD or GeM
+    - aggregate global descriptors with VLAD, GeM, CLS, GAP, or GMP
     - coarse retrieval over satellite tiles
     - optional local reranking over coarse top-k
     - optional similarity-map offset prediction
@@ -65,6 +65,7 @@ from cvgl_retrieval import (
     coarse_retrieve_topk,
     fit_vlad_for_dataset,
     predict_top1_offsets,
+    predict_top1_offsets_sliding_ncc,
     rerank_with_local_features,
 )
 from dvgl_benchmark.datasets_ws import BaseDataset
@@ -166,7 +167,7 @@ class LocalArgs:
     """
     cache_vlad_descs: bool = False
     cache_dense_features: bool = True
-    global_agg: Literal["vlad", "gem"] = "vlad"
+    global_agg: Literal["vlad", "gem", "cls", "gap", "gmp"] = "vlad"
     """
         Global aggregation for coarse retrieval.
     """
@@ -175,22 +176,23 @@ class LocalArgs:
     gem_elem_by_elem: bool = False
     use_local_rerank: bool = True
     coarse_top_k: int = 10
+    coarse_device: str = "auto"
     local_match_method: Literal["cosine_pool", "mutual_nn", "sim_map"] = "sim_map"
     rerank_alpha: float = 0.5
     local_top_m: int = 32
     use_offset_head: bool = True
     """
         Kept for forward compatibility with future learned heads.
-        Current baseline uses a similarity-map estimator when enabled.
+        Current baseline uses the selected local-feature offset estimator.
     """
-    offset_prediction_method: Literal["none", "sim_map"] = "sim_map"
+    offset_prediction_method: Literal["none", "sim_map", "slide_ncc"] = "slide_ncc"
     offset_loss_type: Literal["l1", "smooth_l1", "mse"] = "smooth_l1"
     """
         Reserved for future learned offset heads.
     """
     tile_size_m: Union[float, None] = None
     tile_size_px: Union[int, None] = None
-    localization_thresholds: List[float] = field(default_factory=lambda: [1.0, 5.0, 10.0])
+    localization_thresholds: List[float] = field(default_factory=lambda: [16.0, 32.0, 64.0])
     cvgl_dataset_root: Union[str, None] = None
     cvgl_tiles_manifest: Union[str, None] = None
     cvgl_queries_manifest: Union[str, None] = None
@@ -410,9 +412,10 @@ def main(largs: LocalArgs):
     db_bank.global_descs = db_global
     qu_bank.global_descs = qu_global
 
+    coarse_device = device if largs.coarse_device == "auto" else torch.device(largs.coarse_device)
     coarse_scores, coarse_indices = coarse_retrieve_topk(
-        db_bank.global_descs,
-        qu_bank.global_descs,
+        db_bank.global_descs.to(coarse_device),
+        qu_bank.global_descs.to(coarse_device),
         top_k=max(max(largs.top_k_vals), largs.coarse_top_k),
     )
     gt_db_indices = _collect_gt_db_indices(dataset, db_indices, qu_indices)
@@ -451,16 +454,28 @@ def main(largs: LocalArgs):
         tile_extent_default = (float(largs.tile_size_m), float(largs.tile_size_m))
     elif largs.tile_size_px is not None:
         tile_extent_default = (float(largs.tile_size_px), float(largs.tile_size_px))
-    if largs.use_offset_head and largs.offset_prediction_method == "sim_map":
-        pred_offsets, sim_maps = predict_top1_offsets(
-            dataset,
-            retrieval_indices,
-            db_bank=db_bank,
-            query_bank=qu_bank,
-            tile_extent_default=tile_extent_default,
-            local_top_m=largs.local_top_m,
-            query_indices=sampled_query_indices,
-        )
+    if largs.use_offset_head and largs.offset_prediction_method != "none":
+        if largs.offset_prediction_method == "sim_map":
+            pred_offsets, sim_maps = predict_top1_offsets(
+                dataset,
+                retrieval_indices,
+                db_bank=db_bank,
+                query_bank=qu_bank,
+                tile_extent_default=tile_extent_default,
+                local_top_m=largs.local_top_m,
+                query_indices=sampled_query_indices,
+            )
+        elif largs.offset_prediction_method == "slide_ncc":
+            pred_offsets, sim_maps = predict_top1_offsets_sliding_ncc(
+                dataset,
+                retrieval_indices,
+                db_bank=db_bank,
+                query_bank=qu_bank,
+                tile_extent_default=tile_extent_default,
+                query_indices=sampled_query_indices,
+            )
+        else:
+            raise ValueError(f"Unknown offset prediction method: {largs.offset_prediction_method}")
         gt_offsets = [dataset.get_query_gt_offset(qi) for qi in sampled_query_indices]
         offset_metrics = evaluate_offset_predictions(
             pred_offsets,

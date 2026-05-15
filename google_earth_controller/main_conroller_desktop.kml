@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>Main Controller</name>
+    <NetworkLink>
+      <name>Dynamic KML</name>
+      <refreshVisibility>1</refreshVisibility>
+      <flyToView>1</flyToView>
+      <Link>
+        <href>file:///E:/zhy/master/Mingli/UAV-navigation/project/UAV_3d_v2/camera_view.kml</href>
+        <refreshMode>onInterval</refreshMode>
+        <refreshInterval>5</refreshInterval>
+      </Link>
+    </NetworkLink>
+  </Document>
+</kml>

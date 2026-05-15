@@ -136,6 +136,72 @@ def _build_run_config_snapshot(
     }
 
 
+def _sync_torch_device(run_device) -> None:
+    run_device = torch.device(run_device)
+    if run_device.type == "cuda" and torch.cuda.is_available():
+        if run_device.index is None:
+            torch.cuda.synchronize()
+        else:
+            torch.cuda.synchronize(run_device)
+
+
+def _tensor_nbytes(value: Optional[torch.Tensor]) -> int:
+    if value is None:
+        return 0
+    return int(value.numel() * value.element_size())
+
+
+def _tensor_list_nbytes(values: List[torch.Tensor]) -> int:
+    return int(sum(_tensor_nbytes(value) for value in values))
+
+
+def _mb(num_bytes: int) -> float:
+    return float(num_bytes) / (1024.0 ** 2)
+
+
+def _build_bank_stats(db_bank, qu_bank):
+    db_local_bytes = _tensor_list_nbytes(db_bank.local_descs)
+    qu_local_bytes = _tensor_list_nbytes(qu_bank.local_descs)
+    db_segment_bytes = _tensor_nbytes(db_bank.segment_descs)
+    qu_segment_bytes = _tensor_nbytes(qu_bank.segment_descs)
+    db_mapping_bytes = _tensor_nbytes(db_bank.segment_to_image) + _tensor_nbytes(db_bank.segment_to_image_pos)
+    qu_mapping_bytes = _tensor_nbytes(qu_bank.segment_to_image) + _tensor_nbytes(qu_bank.segment_to_image_pos)
+    db_bank_bytes = db_local_bytes + db_segment_bytes + db_mapping_bytes
+    qu_bank_bytes = qu_local_bytes + qu_segment_bytes + qu_mapping_bytes
+    total_bytes = db_bank_bytes + qu_bank_bytes
+    descriptor_dim = 0
+    if len(db_bank.local_descs) > 0:
+        descriptor_dim = int(db_bank.local_descs[0].shape[-1])
+    elif len(qu_bank.local_descs) > 0:
+        descriptor_dim = int(qu_bank.local_descs[0].shape[-1])
+    segment_descriptor_dim = int(db_bank.segment_descs.shape[1]) if db_bank.segment_descs.ndim == 2 else 0
+    return {
+        "descriptor_dim": descriptor_dim,
+        "segment_descriptor_dim": segment_descriptor_dim,
+        "db_local_desc_bytes": db_local_bytes,
+        "query_local_desc_bytes": qu_local_bytes,
+        "db_segment_desc_bytes": db_segment_bytes,
+        "query_segment_desc_bytes": qu_segment_bytes,
+        "db_mapping_bytes": db_mapping_bytes,
+        "query_mapping_bytes": qu_mapping_bytes,
+        "db_bank_bytes": db_bank_bytes,
+        "query_bank_bytes": qu_bank_bytes,
+        "total_bank_bytes": total_bytes,
+        "db_local_desc_mb": _mb(db_local_bytes),
+        "query_local_desc_mb": _mb(qu_local_bytes),
+        "db_segment_desc_mb": _mb(db_segment_bytes),
+        "query_segment_desc_mb": _mb(qu_segment_bytes),
+        "db_bank_mb": _mb(db_bank_bytes),
+        "query_bank_mb": _mb(qu_bank_bytes),
+        "total_bank_mb": _mb(total_bytes),
+    }
+
+
+def _normalize_profile(profile):
+    return {key: (int(val) if str(key).endswith(("count", "hits", "misses", "images", "segments")) else float(val))
+            for key, val in sorted(profile.items())}
+
+
 @dataclass
 class LocalArgs:
     prog: ProgArgs = ProgArgs(wandb_proj="Dino-v2-Descs",
@@ -307,6 +373,9 @@ def _collect_gt_db_indices(dataset, db_indices, qu_indices) -> List[Optional[int
 
 @torch.no_grad()
 def main(largs: LocalArgs):
+    total_start = time.perf_counter()
+    stage_times = {}
+    runtime_profile = {}
     print(f"Arguments: {largs}")
     seed_everything(42)
     dataset = _load_dataset(largs)
@@ -329,12 +398,15 @@ def main(largs: LocalArgs):
         print(f"Initialized WandB run: {wandb_run.name}")
 
     print("--------- Building SegVLAD banks ---------")
+    start = time.perf_counter()
     dino = DinoV2ExtractFeatures(
         largs.model_type,
         largs.desc_layer,
         largs.desc_facet,
         device=device,
     )
+    _sync_torch_device(device)
+    stage_times["model_init_time_s"] = time.perf_counter() - start
     db_indices = np.arange(0, dataset.database_num, largs.sub_sample_db)
     qu_indices = np.arange(
         dataset.database_num,
@@ -345,6 +417,7 @@ def main(largs: LocalArgs):
 
     vlad = None
     if largs.segment_descriptor == "segvlad":
+        start = time.perf_counter()
         vlad = fit_vlad_for_dataset(
             dataset,
             db_indices=db_indices,
@@ -356,7 +429,9 @@ def main(largs: LocalArgs):
             vlad_soft_temp=largs.vlad_soft_temp,
             feature_cache_root=dense_cache_root,
             vlad_cache_root=vlad_cache_root,
+            profile=runtime_profile,
         )
+        stage_times["vlad_fit_time_s"] = time.perf_counter() - start
     sam_generator = None
     seg_cfg_runtime = largs.seg_cfg
     if largs.seg_cfg.source in ["sam", "manifest_or_sam"]:
@@ -387,6 +462,7 @@ def main(largs: LocalArgs):
             float(largs.segvlad_relative_context_ref_grid_size),
         )
 
+    start = time.perf_counter()
     db_bank = build_segvlad_feature_bank(
         dataset,
         indices=db_indices,
@@ -406,7 +482,10 @@ def main(largs: LocalArgs):
         relative_context_ref_grid_hw=relative_context_ref_grid_hw,
         seg_cfg=seg_cfg_runtime,
         sam_generator=sam_generator,
+        profile=runtime_profile,
     )
+    stage_times["db_segvlad_build_time_s"] = time.perf_counter() - start
+    start = time.perf_counter()
     qu_bank = build_segvlad_feature_bank(
         dataset,
         indices=qu_indices,
@@ -426,19 +505,29 @@ def main(largs: LocalArgs):
         relative_context_ref_grid_hw=relative_context_ref_grid_hw,
         seg_cfg=seg_cfg_runtime,
         sam_generator=sam_generator,
+        profile=runtime_profile,
+    )
+    stage_times["query_segvlad_build_time_s"] = time.perf_counter() - start
+    stage_times["segvlad_build_time_s"] = (
+        stage_times["db_segvlad_build_time_s"] + stage_times["query_segvlad_build_time_s"]
     )
     print("--------- SegVLAD banks ready ---------")
 
+    retrieval_device = device if largs.coarse_device == "auto" else largs.coarse_device
+    _sync_torch_device(retrieval_device)
+    start = time.perf_counter()
     coarse_scores, coarse_indices = coarse_retrieve_topk_segvlad(
         db_bank,
         qu_bank,
         top_k=max(max(largs.top_k_vals), largs.coarse_top_k),
         segment_top_k=largs.segment_top_k,
         aggregation=largs.coarse_aggregation,
-        device=device if largs.coarse_device == "auto" else largs.coarse_device,
+        device=retrieval_device,
         db_segment_chunk_size=largs.coarse_db_segment_chunk_size,
         query_batch_size=largs.coarse_query_batch_size,
     )
+    _sync_torch_device(retrieval_device)
+    stage_times["retrieval_time_s"] = time.perf_counter() - start
     gt_db_indices = _collect_gt_db_indices(dataset, db_indices, qu_indices)
     coarse_metrics = evaluate_cvgl_retrieval(
         coarse_indices[:, :max(largs.top_k_vals)],
@@ -451,6 +540,7 @@ def main(largs: LocalArgs):
     local_score_table = None
     refined_metrics = {}
     if largs.use_local_rerank:
+        start = time.perf_counter()
         retrieval_scores, retrieval_indices, local_score_table = rerank_with_local_features(
             retrieval_scores,
             retrieval_indices,
@@ -465,6 +555,9 @@ def main(largs: LocalArgs):
             gt_db_indices,
             largs.top_k_vals,
         )
+        stage_times["local_rerank_time_s"] = time.perf_counter() - start
+    else:
+        stage_times["local_rerank_time_s"] = 0.0
 
     pred_offsets = []
     sim_maps = []
@@ -476,6 +569,7 @@ def main(largs: LocalArgs):
     elif largs.tile_size_px is not None:
         tile_extent_default = (float(largs.tile_size_px), float(largs.tile_size_px))
     if largs.use_offset_head and largs.offset_prediction_method != "none":
+        start = time.perf_counter()
         if largs.offset_prediction_method == "sim_map":
             pred_offsets, sim_maps = predict_top1_offsets(
                 dataset,
@@ -511,6 +605,32 @@ def main(largs: LocalArgs):
             query_indices=sampled_query_indices,
             db_indices_map=db_bank.indices,
         )
+        stage_times["offset_prediction_time_s"] = time.perf_counter() - start
+    else:
+        stage_times["offset_prediction_time_s"] = 0.0
+
+    bank_stats = _build_bank_stats(db_bank, qu_bank)
+    num_queries = max(1, len(qu_bank.indices))
+    stage_times["total_time_s"] = time.perf_counter() - total_start
+    runtime_stats = {
+        "descriptor_dim": bank_stats["descriptor_dim"],
+        "segment_descriptor_dim": bank_stats["segment_descriptor_dim"],
+        "bank_size": bank_stats,
+        "profile": _normalize_profile(runtime_profile),
+        "stage_times_s": stage_times,
+        "per_query_s": {
+            "feature_access": float(
+                runtime_profile.get("feature_cache_load_time_s", 0.0)
+                + runtime_profile.get("image_load_time_s", 0.0)
+                + runtime_profile.get("feature_extract_time_s", 0.0)
+            ) / num_queries,
+            "feature_extract": float(runtime_profile.get("feature_extract_time_s", 0.0)) / num_queries,
+            "segvlad_build": float(stage_times["segvlad_build_time_s"]) / num_queries,
+            "retrieval": float(stage_times["retrieval_time_s"]) / num_queries,
+            "offset_prediction": float(stage_times["offset_prediction_time_s"]) / num_queries,
+            "total": float(stage_times["total_time_s"]) / num_queries,
+        },
+    }
 
     results = {
         "CVGL-Dataset": str(largs.cvgl_dataset_root),
@@ -529,6 +649,24 @@ def main(largs: LocalArgs):
         "Num-QU": str(len(qu_bank.indices)),
         "Num-DB-Segments": int(db_bank.segment_descs.shape[0]),
         "Num-QU-Segments": int(qu_bank.segment_descs.shape[0]),
+        "Descriptor-Dim": int(runtime_stats["descriptor_dim"]),
+        "Segment-Descriptor-Dim": int(runtime_stats["segment_descriptor_dim"]),
+        "Bank-Size-MB": float(bank_stats["total_bank_mb"]),
+        "DB-Bank-Size-MB": float(bank_stats["db_bank_mb"]),
+        "Query-Bank-Size-MB": float(bank_stats["query_bank_mb"]),
+        "DB-Segment-Bank-Size-MB": float(bank_stats["db_segment_desc_mb"]),
+        "Query-Segment-Bank-Size-MB": float(bank_stats["query_segment_desc_mb"]),
+        "Feature-Time-s": float(
+            runtime_profile.get("feature_cache_load_time_s", 0.0)
+            + runtime_profile.get("image_load_time_s", 0.0)
+            + runtime_profile.get("feature_extract_time_s", 0.0)
+        ),
+        "DINO-Feature-Extract-Time-s": float(runtime_profile.get("feature_extract_time_s", 0.0)),
+        "SegVLAD-Build-Time-s": float(stage_times["segvlad_build_time_s"]),
+        "Retrieval-Time-s": float(stage_times["retrieval_time_s"]),
+        "Offset-Prediction-Time-s": float(stage_times["offset_prediction_time_s"]),
+        "Total-Time-Per-Query-s": float(runtime_stats["per_query_s"]["total"]),
+        "Runtime-Stats": runtime_stats,
         "SegVLAD-Centroid-PE-Freqs": int(largs.segvlad_centroid_pe_num_freqs),
         "SegVLAD-Centroid-PE-Weight": float(largs.segvlad_centroid_pe_weight),
         "SegVLAD-Relative-Context-Freqs": int(largs.segvlad_relative_context_num_freqs),

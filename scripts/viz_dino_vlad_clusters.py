@@ -34,7 +34,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from cvgl_retrieval import extract_dense_record
 from utilities import DinoV2ExtractFeatures, VLAD
@@ -131,6 +131,14 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip images whose main overlay output already exists.",
     )
+    parser.add_argument("--panel-size", type=int, default=None, help="Optional square panel size.")
+    parser.add_argument("--cols", type=int, default=3, help="Number of columns in composed figures.")
+    parser.add_argument("--gap", type=int, default=18, help="Gap between panels.")
+    parser.add_argument("--margin", type=int, default=18, help="Outer figure margin.")
+    parser.add_argument("--header-height", type=int, default=36, help="Panel header height.")
+    parser.add_argument("--font-size", type=int, default=22, help="Panel header font size.")
+    parser.add_argument("--no-headers", action="store_true", help="Do not draw panel headers.")
+    parser.add_argument("--dpi", type=int, default=300, help="DPI metadata for output figures.")
     return parser.parse_args()
 
 
@@ -224,25 +232,77 @@ def _blend_overlay(base_rgb: np.ndarray, color_rgb: np.ndarray, alpha: float) ->
     return np.clip(blended, 0.0, 255.0).astype(np.uint8)
 
 
-def _concat_panels_h(images: List[np.ndarray]) -> np.ndarray:
-    max_h = max(img.shape[0] for img in images)
-    padded = []
-    for img in images:
-        if img.shape[0] == max_h:
-            padded.append(img)
-            continue
-        canvas = np.full((max_h, img.shape[1], 3), 255, dtype=np.uint8)
-        canvas[: img.shape[0]] = img
-        padded.append(canvas)
-    return np.concatenate(padded, axis=1)
+def _font(size: int) -> ImageFont.ImageFont:
+    candidates = [
+        "/usr/share/fonts/truetype/msttcorefonts/Times_New_Roman.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/times.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return ImageFont.truetype(path, size=size)
+    return ImageFont.load_default()
 
 
-def _add_header(img: np.ndarray, text: str, header_h: int = 28) -> np.ndarray:
+def _add_header(img: np.ndarray, text: str, header_h: int, font_size: int) -> np.ndarray:
     pil = Image.new("RGB", (img.shape[1], img.shape[0] + header_h), color=(255, 255, 255))
     pil.paste(Image.fromarray(img), (0, header_h))
     draw = ImageDraw.Draw(pil)
-    draw.text((8, 6), text, fill=(0, 0, 0))
+    font = _font(font_size)
+    max_w = img.shape[1] - 16
+    while font_size > 10 and draw.textbbox((0, 0), text, font=font)[2] > max_w:
+        font_size -= 1
+        font = _font(font_size)
+    draw.text((8, max(2, (header_h - font_size) // 2)), text, fill=(0, 0, 0), font=font)
     return np.asarray(pil)
+
+
+def _resize_panel(img: np.ndarray, panel_size: Optional[int]) -> np.ndarray:
+    if panel_size is None:
+        return img
+    pil = Image.fromarray(img)
+    pil = ImageOps.fit(
+        pil,
+        (int(panel_size), int(panel_size)),
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.5),
+    )
+    return np.asarray(pil)
+
+
+def _compose_grid(
+    panels: List[tuple[str, np.ndarray]],
+    out_path: str,
+    args: argparse.Namespace,
+    cols: Optional[int] = None,
+) -> None:
+    cols = int(cols if cols is not None else args.cols)
+    cols = max(1, cols)
+    rendered = []
+    for title, img in panels:
+        panel = _resize_panel(img, args.panel_size)
+        if not args.no_headers:
+            panel = _add_header(panel, title, args.header_height, args.font_size)
+        rendered.append(panel)
+    panel_w = max(img.shape[1] for img in rendered)
+    panel_h = max(img.shape[0] for img in rendered)
+    rows = int(np.ceil(len(rendered) / cols))
+    canvas_w = args.margin * 2 + cols * panel_w + (cols - 1) * args.gap
+    canvas_h = args.margin * 2 + rows * panel_h + (rows - 1) * args.gap
+    canvas = Image.new("RGB", (canvas_w, canvas_h), color=(255, 255, 255))
+    for i, panel in enumerate(rendered):
+        row = i // cols
+        col = i % cols
+        x = args.margin + col * (panel_w + args.gap)
+        y = args.margin + row * (panel_h + args.gap)
+        if panel.shape[1] != panel_w or panel.shape[0] != panel_h:
+            padded = Image.new("RGB", (panel_w, panel_h), color=(255, 255, 255))
+            padded.paste(Image.fromarray(panel), (0, 0))
+            panel_img = padded
+        else:
+            panel_img = Image.fromarray(panel)
+        canvas.paste(panel_img, (x, y))
+    canvas.save(out_path, dpi=(int(args.dpi), int(args.dpi)))
 
 
 def _save_main_figure(
@@ -251,18 +311,21 @@ def _save_main_figure(
     num_clusters: int,
     out_path: str,
     alpha: float,
+    args: argparse.Namespace,
 ) -> List[List[int]]:
     palette = _make_cluster_palette(num_clusters)
     colorized = _colorize_label_map(label_map, palette)
     overlay = _blend_overlay(cropped_rgb, colorized, alpha=alpha)
-    panel = _concat_panels_h(
+    _compose_grid(
         [
-            _add_header(cropped_rgb, "Cropped Image"),
-            _add_header(colorized, "Patch Cluster Map"),
-            _add_header(overlay, "Overlay"),
-        ]
+            ("Cropped Image", cropped_rgb),
+            ("Patch Cluster Map", colorized),
+            ("Overlay", overlay),
+        ],
+        out_path=out_path,
+        args=args,
+        cols=3,
     )
-    Image.fromarray(panel).save(out_path)
     return palette
 
 
@@ -273,6 +336,7 @@ def _save_soft_heatmaps(
     out_hw: tuple[int, int],
     out_path: str,
     topk: int,
+    args: argparse.Namespace,
 ) -> None:
     cluster_strength = soft_assign.mean(dim=0)
     topk = min(topk, int(soft_assign.shape[1]))
@@ -285,8 +349,8 @@ def _save_soft_heatmaps(
         )
         heat_rgb = _heatmap_to_rgb(heatmap)
         overlay = _blend_overlay(cropped_rgb, heat_rgb, alpha=0.55)
-        panels.append(_add_header(overlay, f"Cluster {cluster_idx}"))
-    Image.fromarray(_concat_panels_h(panels)).save(out_path)
+        panels.append((f"Cluster {cluster_idx}", overlay))
+    _compose_grid(panels, out_path=out_path, args=args, cols=args.cols)
 
 
 def _heatmap_to_rgb(heatmap: np.ndarray) -> np.ndarray:
@@ -402,6 +466,7 @@ def process_image(
         num_clusters=int(vlad.c_centers.shape[0]),
         out_path=os.path.join(out_dir, f"{image_name}_cluster_overlay.png"),
         alpha=args.alpha,
+        args=args,
     )
 
     if soft_assign is not None:
@@ -412,6 +477,7 @@ def process_image(
             out_hw=record.cropped_hw,
             out_path=os.path.join(out_dir, f"{image_name}_soft_heatmaps.png"),
             topk=args.topk_soft_clusters,
+            args=args,
         )
 
     with open(os.path.join(out_dir, f"{image_name}_palette.json"), "w", encoding="utf-8") as f:

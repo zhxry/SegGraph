@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+        <kml xmlns="http://www.opengis.net/kml/2.2">
+            <Document>
+            <Camera>
+            <longitude>36.171078</longitude>
+            <latitude>36.233211</latitude>
+            <altitude>204.5</altitude>
+            <heading>0</heading>
+            <tilt>0</tilt>
+            <roll>0</roll>
+            <altitudeMode>relativeToGround</altitudeMode>
+            </Camera>
+            </Document>
+            </kml>
+            

@@ -5,6 +5,7 @@
 
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple, Union
 
@@ -64,6 +65,27 @@ class SegVLADFeatureBank:
 
 def _sanitize_cache_id(cache_id: str) -> str:
     return cache_id.replace("\\", "/")
+
+
+def _profile_add(profile: Optional[Dict[str, float]], key: str, value: float) -> None:
+    if profile is None:
+        return
+    profile[key] = float(profile.get(key, 0.0)) + float(value)
+
+
+def _profile_inc(profile: Optional[Dict[str, float]], key: str, value: int = 1) -> None:
+    if profile is None:
+        return
+    profile[key] = int(profile.get(key, 0)) + int(value)
+
+
+def _sync_device(device: Union[str, torch.device]) -> None:
+    device = torch.device(device)
+    if device.type == "cuda" and torch.cuda.is_available():
+        if device.index is None:
+            torch.cuda.synchronize()
+        else:
+            torch.cuda.synchronize(device)
 
 
 def _center_crop_masks(
@@ -494,11 +516,15 @@ def load_or_extract_record(
     gem_use_abs: bool = False,
     gem_elem_by_elem: bool = False,
     patch_stride: int = 14,
+    profile: Optional[Dict[str, float]] = None,
 ) -> DenseFeatureRecord:
     relpath = dataset.get_image_relpaths(index)
     cache_path = _feature_cache_path(cache_root, relpath)
     if cache_path is not None and os.path.isfile(cache_path):
+        start = time.perf_counter()
         payload = torch.load(cache_path)
+        _profile_add(profile, "feature_cache_load_time_s", time.perf_counter() - start)
+        _profile_inc(profile, "feature_cache_hits")
         if global_agg == "vlad" or payload.get("global_desc") is not None:
             return DenseFeatureRecord(
                 local_desc=payload["local_desc"],
@@ -508,13 +534,23 @@ def load_or_extract_record(
                 patch_stride=int(payload["patch_stride"]),
                 global_desc=payload.get("global_desc"),
             )
+        _profile_inc(profile, "feature_cache_incomplete")
+    _profile_inc(profile, "feature_cache_misses")
+    start = time.perf_counter()
     img, _ = dataset[index]
+    _profile_add(profile, "image_load_time_s", time.perf_counter() - start)
+    _sync_device(device)
+    start = time.perf_counter()
     record = extract_dense_record(
         img, dino=dino, device=device, patch_stride=patch_stride,
         global_agg=global_agg, gem_p=gem_p,
         gem_use_abs=gem_use_abs, gem_elem_by_elem=gem_elem_by_elem,
     )
+    _sync_device(device)
+    _profile_add(profile, "feature_extract_time_s", time.perf_counter() - start)
+    _profile_inc(profile, "feature_extract_count")
     if cache_path is not None:
+        start = time.perf_counter()
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         torch.save({
             "local_desc": record.local_desc,
@@ -524,6 +560,7 @@ def load_or_extract_record(
             "patch_stride": record.patch_stride,
             "global_desc": record.global_desc,
         }, cache_path)
+        _profile_add(profile, "feature_cache_save_time_s", time.perf_counter() - start)
     return record
 
 
@@ -540,7 +577,9 @@ def fit_vlad_for_dataset(
     vlad_cache_root: Optional[str] = None,
     patch_stride: int = 14,
     verbose: bool = True,
+    profile: Optional[Dict[str, float]] = None,
 ) -> VLAD:
+    stage_start = time.perf_counter()
     vlad = VLAD(
         num_clusters,
         None,
@@ -549,8 +588,13 @@ def fit_vlad_for_dataset(
         cache_dir=vlad_cache_root,
     )
     if vlad.can_use_cache_vlad():
+        start = time.perf_counter()
         vlad.fit(None)
+        _profile_add(profile, "vlad_cache_load_time_s", time.perf_counter() - start)
+        _profile_add(profile, "vlad_fit_stage_time_s", time.perf_counter() - stage_start)
+        _profile_inc(profile, "vlad_cache_hits")
         return vlad
+    _profile_inc(profile, "vlad_cache_misses")
     train_descs = []
     fit_indices = list(db_indices)[::sub_sample_db_vlad]
     iterator = tqdm(fit_indices, disable=(not verbose) or (not sys.stderr.isatty()), desc="VLAD clusters")
@@ -559,11 +603,15 @@ def fit_vlad_for_dataset(
             dataset, idx, dino=dino, device=device,
             cache_root=feature_cache_root, global_agg="vlad",
             patch_stride=patch_stride,
+            profile=profile,
         )
         train_descs.append(record.local_desc.reshape(-1, record.local_desc.shape[-1]))
     if len(train_descs) == 0:
         raise ValueError("No descriptors collected for VLAD fitting")
+    start = time.perf_counter()
     vlad.fit(torch.cat(train_descs, dim=0))
+    _profile_add(profile, "vlad_fit_compute_time_s", time.perf_counter() - start)
+    _profile_add(profile, "vlad_fit_stage_time_s", time.perf_counter() - stage_start)
     return vlad
 
 
@@ -580,7 +628,9 @@ def build_feature_bank(
     gem_elem_by_elem: bool = False,
     patch_stride: int = 14,
     verbose: bool = True,
+    profile: Optional[Dict[str, float]] = None,
 ) -> FeatureBank:
+    stage_start = time.perf_counter()
     all_globals = []
     all_locals = []
     grid_hws = []
@@ -594,6 +644,7 @@ def build_feature_bank(
             cache_root=feature_cache_root, global_agg=global_agg,
             gem_p=gem_p, gem_use_abs=gem_use_abs,
             gem_elem_by_elem=gem_elem_by_elem, patch_stride=patch_stride,
+            profile=profile,
         )
         local_flat = record.local_desc.reshape(-1, record.local_desc.shape[-1])
         relpath = dataset.get_image_relpaths(idx)
@@ -613,6 +664,8 @@ def build_feature_bank(
         relpaths.append(relpath)
     if len(all_globals) == 0:
         raise ValueError("Feature bank is empty")
+    _profile_add(profile, "feature_bank_build_time_s", time.perf_counter() - stage_start)
+    _profile_inc(profile, "feature_bank_num_images", len(all_globals))
     return FeatureBank(
         indices=list(indices),
         relpaths=relpaths,
@@ -646,7 +699,9 @@ def build_segvlad_feature_bank(
     seg_cfg: Optional[SegmentorConfig] = None,
     sam_generator: Optional[SAMGenerator] = None,
     verbose: bool = True,
+    profile: Optional[Dict[str, float]] = None,
 ) -> SegVLADFeatureBank:
+    stage_start = time.perf_counter()
     if seg_cfg is None:
         seg_cfg = SegmentorConfig()
     if segment_descriptor == "segvlad" and vlad is None:
@@ -679,7 +734,9 @@ def build_segvlad_feature_bank(
             dataset, idx, dino=dino, device=device,
             cache_root=feature_cache_root, global_agg="vlad",
             patch_stride=patch_stride,
+            profile=profile,
         )
+        start = time.perf_counter()
         masks = load_or_generate_masks(
             dataset,
             idx,
@@ -687,6 +744,8 @@ def build_segvlad_feature_bank(
             mask_generator=sam_generator,
             cache_root=masks_cache_root,
         )
+        _profile_add(profile, "mask_load_or_generate_time_s", time.perf_counter() - start)
+        start = time.perf_counter()
         mask_grid, pixel_masks = project_masks_to_patch_grid(
             masks,
             image_hw=record.image_hw,
@@ -694,6 +753,8 @@ def build_segvlad_feature_bank(
             grid_hw=record.grid_hw,
             min_area_ratio=min_mask_area_ratio,
         )
+        _profile_add(profile, "mask_project_time_s", time.perf_counter() - start)
+        start = time.perf_counter()
         adjacency = build_mask_adjacency_revisit(
             mask_grid,
             pixel_masks=pixel_masks,
@@ -710,7 +771,9 @@ def build_segvlad_feature_bank(
                 order=relative_context_order,
                 method=seg_cfg.neighbor_method,
         )
+        _profile_add(profile, "mask_adjacency_time_s", time.perf_counter() - start)
         local_flat = record.local_desc.reshape(-1, record.local_desc.shape[-1])
+        start = time.perf_counter()
         if segment_descriptor == "segvlad":
             seg_descs = segvlad_descriptors(
                 local_flat,
@@ -740,6 +803,9 @@ def build_segvlad_feature_bank(
             )
         else:
             raise ValueError(f"Unknown segment descriptor: {segment_descriptor}")
+        _profile_add(profile, "segment_descriptor_build_time_s", time.perf_counter() - start)
+        _profile_inc(profile, "segment_bank_num_images")
+        _profile_inc(profile, "segment_bank_num_segments", int(seg_descs.shape[0]))
 
         relpaths.append(dataset.get_image_relpaths(idx))
         all_locals.append(record.local_desc)
@@ -754,6 +820,10 @@ def build_segvlad_feature_bank(
 
     if len(flat_segment_descs) == 0:
         raise ValueError("SegVLAD feature bank is empty")
+    start = time.perf_counter()
+    segment_descs = torch.cat(flat_segment_descs, dim=0)
+    _profile_add(profile, "segment_bank_concat_time_s", time.perf_counter() - start)
+    _profile_add(profile, "segment_bank_build_time_s", time.perf_counter() - stage_start)
     return SegVLADFeatureBank(
         indices=list(indices),
         relpaths=relpaths,
@@ -764,7 +834,7 @@ def build_segvlad_feature_bank(
         patch_stride=patch_stride,
         image_segment_descs=image_segment_descs,
         image_segment_counts=image_segment_counts,
-        segment_descs=torch.cat(flat_segment_descs, dim=0),
+        segment_descs=segment_descs,
         segment_to_image=torch.as_tensor(segment_to_image, dtype=torch.long),
         segment_to_image_pos=torch.as_tensor(segment_to_image_pos, dtype=torch.long),
     )

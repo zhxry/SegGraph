@@ -1,8 +1,9 @@
 python scripts/merge_vlad_vocabularies.py \
     --num-clusters 32 \
-    .cache/cvgl_descs/California_wildfire_2025_2_336_intile-7288fff21038/dinov2_vitg14-value-L31-segvlad/dense/tiles \
-    --output .cache/vocabulary/merged/dinov2_vitg14-value-L31-segvlad/california2_fewshot \
-    --single-scene-sweep
+    .cache/cvgl_descs/Moore_tornado_2013_1_336_intile-3a575b04b209/dinov2_vitg14-value-L31-segvlad/dense/tiles \
+    .cache/cvgl_descs/Moore_tornado_2013_1_336_intile-3a575b04b209/dinov2_vitg14-value-L31-segvlad/dense/tile_post \
+    --output .cache/vocabulary/merged/dinov2_vitg14-value-L31-segvlad/moore1_prepost
+    # --single-scene-sweep
     # .cache/cvgl_descs/Hawaii_wildfire_2023_1_336_intile-2db138713ce6/dinov2_vitg14-value-L31-segvlad/dense/tiles \
     # .cache/cvgl_descs/Hawaii_wildfire_2023_1_336_intile-2db138713ce6/dinov2_vitg14-value-L31-segvlad/dense/tile_post \
     # .cache/cvgl_descs/Acapulco_tornado_2023_1_336_intile-9b05a025b74a/dinov2_vitg14-value-L31-segvlad/dense/tiles \

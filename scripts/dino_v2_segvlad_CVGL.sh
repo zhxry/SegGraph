@@ -1,14 +1,13 @@
 CUDA_VISIBLE_DEVICES=2 python scripts/dino_v2_segvlad_CVGL.py \
     --prog.cache-dir .cache \
-    --exp-id cvgl_segvlad_v31_run \
+    --exp-id cvgl_segvlad_run \
     --task-mode cvgl \
-    --cvgl-dataset-root data/California_wildfire_2025_2_336_intile \
-    --pretrained_vlad_centers .cache/vocabulary/merged/dinov2_vitg14-value-L31-segvlad/california2_fewshot/tiles-004_vlad-C32/c_centers.pt \
+    --cvgl-dataset-root data/Hawaii_wildfire_2023_1_336_intile \
     --data-split test \
     --model-type dinov2_vitg14 \
     --num-clusters 32 \
-    --desc-layer 31 \
-    --desc-facet value \
+    --desc-layer 23 \
+    --desc-facet key \
     --coarse-device cuda \
     --segment-descriptor segvlad \
     --segvlad-neighbor-order 3 \
@@ -22,7 +21,7 @@ CUDA_VISIBLE_DEVICES=2 python scripts/dino_v2_segvlad_CVGL.py \
     --coarse-top-k 10 \
     --tile-size-px 512 \
     --use-offset-head \
-    --offset-prediction-method slide_ncc \
+    --offset-prediction-method sim_map \
     --no-use-local-rerank \
     # --local-match-method sim_map \
     # --pretrained_vlad_centers .cache/vocabulary/VPAir/c_centers.pt \

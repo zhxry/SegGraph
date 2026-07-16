@@ -129,7 +129,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip images whose main overlay output already exists.",
+        help="Skip images whose expected outputs already exist.",
     )
     parser.add_argument("--panel-size", type=int, default=None, help="Optional square panel size.")
     parser.add_argument("--cols", type=int, default=3, help="Number of columns in composed figures.")
@@ -138,6 +138,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--header-height", type=int, default=36, help="Panel header height.")
     parser.add_argument("--font-size", type=int, default=22, help="Panel header font size.")
     parser.add_argument("--no-headers", action="store_true", help="Do not draw panel headers.")
+    parser.add_argument("--no-intermediates", action="store_true", help="Do not save the standalone overlay image.")
     parser.add_argument("--dpi", type=int, default=300, help="DPI metadata for output figures.")
     return parser.parse_args()
 
@@ -305,6 +306,21 @@ def _compose_grid(
     canvas.save(out_path, dpi=(int(args.dpi), int(args.dpi)))
 
 
+def _overlay_intermediate_path(main_out_path: str) -> str:
+    path = Path(main_out_path)
+    stem = path.stem
+    if stem.endswith("_cluster_overlay"):
+        stem = stem[: -len("_cluster_overlay")]
+    return str(path.with_name(f"{stem}_overlay.png"))
+
+
+def _save_overlay_intermediate(overlay: np.ndarray, main_out_path: str, args: argparse.Namespace) -> str:
+    out_path = _overlay_intermediate_path(main_out_path)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(overlay).save(out_path, dpi=(int(args.dpi), int(args.dpi)))
+    return out_path
+
+
 def _save_main_figure(
     cropped_rgb: np.ndarray,
     label_map: np.ndarray,
@@ -316,6 +332,8 @@ def _save_main_figure(
     palette = _make_cluster_palette(num_clusters)
     colorized = _colorize_label_map(label_map, palette)
     overlay = _blend_overlay(cropped_rgb, colorized, alpha=alpha)
+    if not args.no_intermediates:
+        _save_overlay_intermediate(overlay, out_path, args)
     _compose_grid(
         [
             ("Cropped Image", cropped_rgb),
@@ -397,6 +415,14 @@ def _resolve_image_output_dir(image_path: str, args: argparse.Namespace) -> str:
 def _overlay_output_path(image_path: str, out_dir: str) -> str:
     image_name = Path(image_path).stem
     return os.path.join(out_dir, f"{image_name}_cluster_overlay.png")
+
+
+def _expected_output_paths(image_path: str, out_dir: str, args: argparse.Namespace) -> List[str]:
+    main_path = _overlay_output_path(image_path, out_dir)
+    paths = [main_path]
+    if not args.no_intermediates:
+        paths.append(_overlay_intermediate_path(main_path))
+    return paths
 
 
 def process_image(
@@ -551,8 +577,8 @@ def main() -> None:
     num_skipped = 0
     for idx, image_path in enumerate(image_paths):
         out_dir = _resolve_image_output_dir(image_path, args)
-        overlay_path = _overlay_output_path(image_path, out_dir)
-        if args.skip_existing and os.path.exists(overlay_path):
+        expected_paths = _expected_output_paths(image_path, out_dir, args)
+        if args.skip_existing and all(os.path.exists(path) for path in expected_paths):
             num_skipped += 1
             print(f"[{idx + 1}/{len(image_paths)}] skip {image_path}")
             continue

@@ -1,5 +1,5 @@
 """
-Visualize DINOv2 local similarity maps used by CVGL offset prediction.
+Visualize DINOv2 local offset prediction maps used by CVGL.
 
 The script diagnoses common offset-prediction failure modes before plotting:
 - missing or mismatched tile extent
@@ -7,6 +7,13 @@ The script diagnoses common offset-prediction failure modes before plotting:
 - GT coord inconsistent with center + offset
 - final top-1 tile different from the GT tile, when a results JSON is given
 - direct-y vs flipped-y GT response on the similarity map
+
+Each output figure compares:
+- Post-disaster Query
+- Pre-disaster Top-1 Tile
+- Similarity Map Response
+- Sliding NCC Response
+- Prediction Overlay
 """
 
 from __future__ import annotations
@@ -21,7 +28,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Visualize sim_map offset prediction and GT offset response."
+        description="Visualize offset prediction with sim_map and sliding NCC response maps."
     )
     parser.add_argument("--cvgl-dataset-root", required=True)
     parser.add_argument("--cvgl-tiles-manifest")
@@ -33,7 +40,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-queries", type=int, default=16)
     parser.add_argument(
         "--tile-source",
-        default="gt",
+        default="top1",
         choices=["gt", "top1"],
         help="Use the GT tile or final top-1 tile from --results-json for visualization.",
     )
@@ -50,8 +57,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=15.0)
     parser.add_argument("--patch-stride", type=int, default=14)
     parser.add_argument("--feature-cache-root")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--tile-size-m", type=float)
     parser.add_argument("--tile-size-px", type=float)
+    parser.add_argument("--panel-size", type=int, default=320)
+    parser.add_argument("--gap", type=int, default=18)
+    parser.add_argument("--margin", type=int, default=18)
+    parser.add_argument("--header-height", type=int, default=32)
+    parser.add_argument("--font-size", type=int, default=18)
+    parser.add_argument("--no-headers", action="store_true")
     parser.add_argument("--dpi", type=int, default=180)
     return parser.parse_args()
 
@@ -166,6 +180,40 @@ def _grid_to_panel_xy(grid_xy: Tuple[float, float], grid_hw: Tuple[int, int], pa
     return x, y
 
 
+def _offset_to_ncc_map_xy(
+    offset_xy: Tuple[float, float],
+    extent_xy: Tuple[float, float],
+    tile_grid_hw: Tuple[int, int],
+    query_grid_hw: Tuple[int, int],
+    ncc_hw: Tuple[int, int],
+) -> Tuple[float, float]:
+    center_col, center_row = _offset_to_grid_xy(offset_xy, extent_xy, tile_grid_hw, flip_y=False)
+    q_h, q_w = query_grid_hw
+    n_h, n_w = ncc_hw
+    col = center_col - (float(q_w) - 1.0) / 2.0
+    row = center_row - (float(q_h) - 1.0) / 2.0
+    return float(np.clip(col, 0.0, max(0.0, n_w - 1.0))), float(np.clip(row, 0.0, max(0.0, n_h - 1.0)))
+
+
+def _ncc_argmax_prediction(
+    ncc_map: torch.Tensor,
+    query_grid_hw: Tuple[int, int],
+    tile_grid_hw: Tuple[int, int],
+    extent_xy: Tuple[float, float],
+) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]:
+    q_h, q_w = query_grid_hw
+    t_h, t_w = tile_grid_hw
+    best_flat = int(torch.argmax(ncc_map.reshape(-1)).item())
+    best_row = best_flat // int(ncc_map.shape[1])
+    best_col = best_flat % int(ncc_map.shape[1])
+    center_col = float(best_col) + (float(q_w) - 1.0) / 2.0
+    center_row = float(best_row) + (float(q_h) - 1.0) / 2.0
+    norm_x = (center_col + 0.5) / float(t_w) - 0.5
+    norm_y = (center_row + 0.5) / float(t_h) - 0.5
+    pred_offset = (norm_x * float(extent_xy[0]), norm_y * float(extent_xy[1]))
+    return pred_offset, (center_col, center_row), (float(best_col), float(best_row))
+
+
 def _draw_markers(
     img: Image.Image,
     grid_hw: Tuple[int, int],
@@ -183,6 +231,54 @@ def _draw_markers(
     if gt_flip_grid_xy is not None:
         fx, fy = _grid_to_panel_xy(gt_flip_grid_xy, grid_hw, img.size)
         draw.rectangle((fx - 9, fy - 9, fx + 9, fy + 9), outline=(255, 255, 255), width=3)
+
+
+def _draw_response_marker(
+    img: Image.Image,
+    grid_hw: Tuple[int, int],
+    xy: Tuple[float, float],
+    color: Tuple[int, int, int],
+    marker: str,
+) -> None:
+    draw = ImageDraw.Draw(img)
+    x, y = _grid_to_panel_xy(xy, grid_hw, img.size)
+    if marker == "x":
+        draw.line((x - 11, y - 11, x + 11, y + 11), fill=color, width=3)
+        draw.line((x - 11, y + 11, x + 11, y - 11), fill=color, width=3)
+    elif marker == "circle":
+        draw.ellipse((x - 10, y - 10, x + 10, y + 10), outline=color, width=3)
+    elif marker == "square":
+        draw.rectangle((x - 9, y - 9, x + 9, y + 9), outline=color, width=3)
+
+
+def _draw_tile_prediction_overlay(
+    tile_img: Image.Image,
+    tile_grid_hw: Tuple[int, int],
+    sim_grid_xy: Tuple[float, float],
+    ncc_grid_xy: Tuple[float, float],
+    gt_grid_xy: Optional[Tuple[float, float]],
+    panel_size: Tuple[int, int],
+) -> Image.Image:
+    panel = _fit_image(tile_img, panel_size)
+    draw = ImageDraw.Draw(panel)
+    font = ImageFont.load_default()
+
+    def draw_point(xy: Tuple[float, float], color: Tuple[int, int, int], label: str, marker: str) -> None:
+        x, y = _grid_to_panel_xy(xy, tile_grid_hw, panel.size)
+        if marker == "x":
+            draw.line((x - 12, y - 12, x + 12, y + 12), fill=color, width=4)
+            draw.line((x - 12, y + 12, x + 12, y - 12), fill=color, width=4)
+        elif marker == "square":
+            draw.rectangle((x - 11, y - 11, x + 11, y + 11), outline=color, width=4)
+        else:
+            draw.ellipse((x - 11, y - 11, x + 11, y + 11), outline=color, width=4)
+        draw.text((x + 13, y - 12), label, fill=color, font=font)
+
+    draw_point(sim_grid_xy, (0, 255, 255), "Sim", "x")
+    draw_point(ncc_grid_xy, (255, 80, 255), "NCC", "square")
+    if gt_grid_xy is not None:
+        draw_point(gt_grid_xy, (80, 255, 80), "GT", "circle")
+    return panel
 
 
 def _draw_panel_label(img: Image.Image, label: str) -> None:
@@ -311,54 +407,72 @@ def _plot_one(
     query_img: Image.Image,
     tile_img: Image.Image,
     sim_map: torch.Tensor,
-    probs: torch.Tensor,
-    pred_grid_xy: Tuple[float, float],
+    ncc_map: torch.Tensor,
+    sim_pred_grid_xy: Tuple[float, float],
+    ncc_pred_tile_grid_xy: Tuple[float, float],
+    ncc_pred_map_xy: Tuple[float, float],
     gt_grid_xy: Optional[Tuple[float, float]],
-    gt_flip_grid_xy: Optional[Tuple[float, float]],
+    gt_ncc_map_xy: Optional[Tuple[float, float]],
     title: str,
-    diagnostics: Sequence[str],
+    subtitle: str,
     dpi: int,
+    panel_size_px: int,
+    margin: int,
+    gap: int,
+    header_h: int,
+    font_size: int,
+    show_headers: bool,
 ) -> None:
-    panel_size = (420, 420)
-    margin = 18
-    title_h = 38
-    text_h = 210
-    width = panel_size[0] * 2 + margin * 3
-    height = title_h + panel_size[1] * 2 + margin * 3 + text_h
-    canvas = Image.new("RGB", (width, height), (245, 245, 245))
+    panel_size = (int(panel_size_px), int(panel_size_px))
+    title_h = 34 if title else 0
+    row_h = panel_size[1] + (header_h if show_headers else 0)
+    panels_w = 5 * panel_size[0] + 4 * gap
+    width = margin * 2 + panels_w
+    height = margin * 2 + title_h + row_h
+    canvas = Image.new("RGB", (width, height), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
-    font = ImageFont.load_default()
-    draw.text((margin, 12), title, fill=(0, 0, 0), font=font)
+    title_font = ImageFont.load_default()
+    header_font = ImageFont.load_default()
+    if title:
+        draw.text((margin, margin // 2), title, fill=(0, 0, 0), font=title_font)
+        if subtitle:
+            bbox = draw.textbbox((0, 0), title, font=title_font)
+            draw.text((margin + bbox[2] + 16, margin // 2), subtitle, fill=(80, 80, 80), font=title_font)
+
+    sim_panel = _heatmap_image(sim_map.detach().cpu().numpy(), "magma", panel_size)
+    _draw_response_marker(sim_panel, sim_map.shape, sim_pred_grid_xy, (0, 255, 255), "x")
+    if gt_grid_xy is not None:
+        _draw_response_marker(sim_panel, sim_map.shape, gt_grid_xy, (80, 255, 80), "circle")
+
+    ncc_panel = _heatmap_image(ncc_map.detach().cpu().numpy(), "viridis", panel_size)
+    _draw_response_marker(ncc_panel, ncc_map.shape, ncc_pred_map_xy, (255, 80, 255), "square")
+    if gt_ncc_map_xy is not None:
+        _draw_response_marker(ncc_panel, ncc_map.shape, gt_ncc_map_xy, (80, 255, 80), "circle")
+
+    overlay_panel = _draw_tile_prediction_overlay(
+        tile_img,
+        tile_grid_hw=sim_map.shape,
+        sim_grid_xy=sim_pred_grid_xy,
+        ncc_grid_xy=ncc_pred_tile_grid_xy,
+        gt_grid_xy=gt_grid_xy,
+        panel_size=panel_size,
+    )
 
     panels = [
-        (_fit_image(query_img, panel_size), "query crop"),
-        (_fit_image(tile_img, panel_size), "tile crop"),
-        (_heatmap_image(sim_map.detach().cpu().numpy(), "magma", panel_size), "raw sim_map"),
-        (_heatmap_image(probs.detach().cpu().numpy(), "viridis", panel_size), "softmax probability"),
+        ("Post-disaster Query", _fit_image(query_img, panel_size)),
+        ("Pre-disaster Top-1 Tile", _fit_image(tile_img, panel_size)),
+        ("Similarity Map Response", sim_panel),
+        ("Sliding NCC Response", ncc_panel),
+        ("Prediction Overlay", overlay_panel),
     ]
-
-    positions = [
-        (margin, title_h + margin),
-        (margin * 2 + panel_size[0], title_h + margin),
-        (margin, title_h + margin * 2 + panel_size[1]),
-        (margin * 2 + panel_size[0], title_h + margin * 2 + panel_size[1]),
-    ]
-    for idx, ((panel, label), pos) in enumerate(zip(panels, positions)):
-        if idx >= 2:
-            _draw_markers(panel, sim_map.shape, pred_grid_xy, gt_grid_xy, gt_flip_grid_xy)
-        _draw_panel_label(panel, label)
-        canvas.paste(panel, pos)
-
-    legend_y = title_h + margin * 3 + panel_size[1] * 2 + 4
-    draw.text((margin, legend_y), "Markers: pred=cyan x, gt=green circle, gt flip-y=white square",
-              fill=(0, 0, 0), font=font)
-    diag_text = "\n".join(diagnostics)
-    y = legend_y + 18
-    for line in _wrap_text(diag_text):
-        draw.text((margin, y), line, fill=(0, 0, 0), font=font)
-        y += 12
-        if y > height - 14:
-            break
+    y0 = margin + title_h
+    for idx, (label, panel) in enumerate(panels):
+        x = margin + idx * (panel_size[0] + gap)
+        y = y0
+        if show_headers:
+            draw.text((x + 4, y), label, fill=(0, 0, 0), font=header_font)
+            y += header_h
+        canvas.paste(panel, (x, y))
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     canvas.save(out_path, dpi=(int(dpi), int(dpi)))
@@ -366,8 +480,8 @@ def _plot_one(
 
 def main() -> None:
     global np, torch, F, T, Image, ImageDraw, ImageFont
-    global CrossViewTileDataset, compute_local_similarity_map, load_or_extract_record
-    global DinoV2ExtractFeatures, seed_everything, device
+    global CrossViewTileDataset, compute_local_similarity_map, compute_sliding_window_ncc_map, load_or_extract_record
+    global DinoV2ExtractFeatures, seed_everything
 
     args = _parse_args()
 
@@ -386,13 +500,16 @@ def main() -> None:
     import torchvision.transforms as T
     from PIL import Image, ImageDraw, ImageFont
 
-    from configs import device
     from custom_datasets.cvgl_dataset import CrossViewTileDataset
-    from cvgl_retrieval import compute_local_similarity_map, load_or_extract_record
+    from cvgl_retrieval import compute_local_similarity_map, compute_sliding_window_ncc_map, load_or_extract_record
     from utilities import DinoV2ExtractFeatures, seed_everything
 
     seed_everything(42)
     os.makedirs(args.output_dir, exist_ok=True)
+    if str(args.device).startswith("cuda") and not torch.cuda.is_available():
+        print("[warn] CUDA unavailable; using CPU")
+        args.device = "cpu"
+    runtime_device = torch.device(args.device)
 
     dataset = CrossViewTileDataset.from_json(
         args.cvgl_dataset_root,
@@ -401,13 +518,15 @@ def main() -> None:
         queries_manifest=args.cvgl_queries_manifest,
     )
     results = _load_json(args.results_json)
+    if args.tile_source == "top1" and results is None:
+        raise ValueError("--tile-source top1 requires --results-json")
     row_map = _result_query_row_map(dataset, results)
 
     dino = DinoV2ExtractFeatures(
         args.model_type,
         args.desc_layer,
         args.desc_facet,
-        device=str(device),
+        device=str(runtime_device),
     )
 
     summary: List[dict] = []
@@ -442,7 +561,7 @@ def main() -> None:
             dataset,
             query_global_idx,
             dino=dino,
-            device=device,
+            device=runtime_device,
             cache_root=args.feature_cache_root,
             patch_stride=args.patch_stride,
         )
@@ -450,7 +569,7 @@ def main() -> None:
             dataset,
             tile_idx,
             dino=dino,
-            device=device,
+            device=runtime_device,
             cache_root=args.feature_cache_root,
             patch_stride=args.patch_stride,
         )
@@ -460,15 +579,33 @@ def main() -> None:
             tile_record.local_desc,
             top_m=args.local_top_m,
         )
-        pred_offset, pred_grid_xy, probs = _softargmax_offset(
+        sim_pred_offset, sim_pred_grid_xy, _probs = _softargmax_offset(
             sim_map,
             extent_xy=extent_xy,
             temperature=args.temperature,
         )
+        ncc_map = compute_sliding_window_ncc_map(
+            query_record.local_desc,
+            tile_record.local_desc,
+        )
+        ncc_pred_offset, ncc_pred_tile_grid_xy, ncc_pred_map_xy = _ncc_argmax_prediction(
+            ncc_map,
+            query_grid_hw=query_record.grid_hw,
+            tile_grid_hw=tile_record.grid_hw,
+            extent_xy=extent_xy,
+        )
         gt_grid_xy = _offset_to_grid_xy(gt_offset, extent_xy, sim_map.shape, flip_y=False)
         gt_flip_grid_xy = _offset_to_grid_xy(gt_offset, extent_xy, sim_map.shape, flip_y=True)
+        gt_ncc_map_xy = _offset_to_ncc_map_xy(
+            gt_offset,
+            extent_xy=extent_xy,
+            tile_grid_hw=tile_record.grid_hw,
+            query_grid_hw=query_record.grid_hw,
+            ncc_hw=ncc_map.shape,
+        )
         gt_stats = _map_value_stats(sim_map, gt_grid_xy[0], gt_grid_xy[1])
         gt_flip_stats = _map_value_stats(sim_map, gt_flip_grid_xy[0], gt_flip_grid_xy[1])
+        ncc_gt_stats = _map_value_stats(ncc_map, gt_ncc_map_xy[0], gt_ncc_map_xy[1])
 
         query_img = _center_crop_pil(dataset.get_image_paths()[query_global_idx], query_record.cropped_hw)
         tile_img = _center_crop_pil(dataset.get_image_paths()[tile_idx], tile_record.cropped_hw)
@@ -479,9 +616,11 @@ def main() -> None:
         diagnostics.append(f"query_image_hw={query_record.image_hw}, query_cropped_hw={query_record.cropped_hw}, query_grid={query_record.grid_hw}")
         diagnostics.append(f"tile_image_hw={tile_record.image_hw}, tile_cropped_hw={tile_record.cropped_hw}, tile_grid={tile_record.grid_hw}")
         diagnostics.append(f"gt_offset={tuple(float(v) for v in gt_offset)}")
-        diagnostics.append(f"pred_offset=({pred_offset[0]:.6g}, {pred_offset[1]:.6g})")
+        diagnostics.append(f"sim_map_pred_offset=({sim_pred_offset[0]:.6g}, {sim_pred_offset[1]:.6g})")
+        diagnostics.append(f"sliding_ncc_pred_offset=({ncc_pred_offset[0]:.6g}, {ncc_pred_offset[1]:.6g})")
         diagnostics.append(f"gt_sim_percentile={gt_stats['percentile']}, gt_rank={gt_stats['rank']}")
         diagnostics.append(f"gt_flip_y_sim_percentile={gt_flip_stats['percentile']}, gt_flip_y_rank={gt_flip_stats['rank']}")
+        diagnostics.append(f"gt_ncc_percentile={ncc_gt_stats['percentile']}, gt_ncc_rank={ncc_gt_stats['rank']}")
 
         out_name = f"query_{query_idx:06d}_tile_{tile_idx:06d}_{args.tile_source}.png"
         out_path = os.path.join(args.output_dir, out_name)
@@ -494,13 +633,21 @@ def main() -> None:
             query_img=query_img,
             tile_img=tile_img,
             sim_map=sim_map,
-            probs=probs,
-            pred_grid_xy=pred_grid_xy,
+            ncc_map=ncc_map,
+            sim_pred_grid_xy=sim_pred_grid_xy,
+            ncc_pred_tile_grid_xy=ncc_pred_tile_grid_xy,
+            ncc_pred_map_xy=ncc_pred_map_xy,
             gt_grid_xy=gt_grid_xy,
-            gt_flip_grid_xy=gt_flip_grid_xy,
+            gt_ncc_map_xy=gt_ncc_map_xy,
             title=title,
-            diagnostics=diagnostics,
+            subtitle="Sim=cyan x, NCC=magenta square, GT=green circle",
             dpi=args.dpi,
+            panel_size_px=args.panel_size,
+            margin=args.margin,
+            gap=args.gap,
+            header_h=args.header_height,
+            font_size=args.font_size,
+            show_headers=not args.no_headers,
         )
 
         row = {
@@ -511,17 +658,29 @@ def main() -> None:
             "top1_is_gt": None if top1_idx is None else bool(int(top1_idx) == int(gt_tile_idx)),
             "extent_xy": [float(extent_xy[0]), float(extent_xy[1])],
             "gt_offset": [float(gt_offset[0]), float(gt_offset[1])],
-            "pred_offset": [float(pred_offset[0]), float(pred_offset[1])],
-            "pred_error_l2": float(np.linalg.norm(np.array(pred_offset) - np.array(gt_offset, dtype=float))),
+            "pred_offset": [float(sim_pred_offset[0]), float(sim_pred_offset[1])],
+            "sim_map_pred_offset": [float(sim_pred_offset[0]), float(sim_pred_offset[1])],
+            "sliding_ncc_pred_offset": [float(ncc_pred_offset[0]), float(ncc_pred_offset[1])],
+            "pred_error_l2": float(np.linalg.norm(np.array(sim_pred_offset) - np.array(gt_offset, dtype=float))),
+            "sim_map_pred_error_l2": float(np.linalg.norm(np.array(sim_pred_offset) - np.array(gt_offset, dtype=float))),
+            "sliding_ncc_pred_error_l2": float(np.linalg.norm(np.array(ncc_pred_offset) - np.array(gt_offset, dtype=float))),
+            "sim_map_shape": [int(sim_map.shape[0]), int(sim_map.shape[1])],
+            "sliding_ncc_shape": [int(ncc_map.shape[0]), int(ncc_map.shape[1])],
             "gt_grid_xy": [float(gt_grid_xy[0]), float(gt_grid_xy[1])],
             "gt_flip_y_grid_xy": [float(gt_flip_grid_xy[0]), float(gt_flip_grid_xy[1])],
-            "pred_grid_xy": [float(pred_grid_xy[0]), float(pred_grid_xy[1])],
+            "sim_map_pred_grid_xy": [float(sim_pred_grid_xy[0]), float(sim_pred_grid_xy[1])],
+            "sliding_ncc_pred_tile_grid_xy": [float(ncc_pred_tile_grid_xy[0]), float(ncc_pred_tile_grid_xy[1])],
+            "sliding_ncc_pred_map_xy": [float(ncc_pred_map_xy[0]), float(ncc_pred_map_xy[1])],
+            "gt_ncc_map_xy": [float(gt_ncc_map_xy[0]), float(gt_ncc_map_xy[1])],
             "gt_sim_value": gt_stats["value"],
             "gt_sim_rank": gt_stats["rank"],
             "gt_sim_percentile": gt_stats["percentile"],
             "gt_flip_y_sim_value": gt_flip_stats["value"],
             "gt_flip_y_sim_rank": gt_flip_stats["rank"],
             "gt_flip_y_sim_percentile": gt_flip_stats["percentile"],
+            "gt_ncc_value": ncc_gt_stats["value"],
+            "gt_ncc_rank": ncc_gt_stats["rank"],
+            "gt_ncc_percentile": ncc_gt_stats["percentile"],
             "output": out_path,
             "diagnostics": diagnostics,
         }

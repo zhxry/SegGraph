@@ -6,5 +6,6 @@ checkpoints/
 tmp/
 logs/
 viz/
+docs/
 .codex
 nohup.out

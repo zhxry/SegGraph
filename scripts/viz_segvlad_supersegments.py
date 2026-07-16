@@ -594,6 +594,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--header-height", type=int, default=36)
     parser.add_argument("--font-size", type=int, default=22)
     parser.add_argument("--no-headers", action="store_true", help="Do not draw panel headers.")
+    parser.add_argument(
+        "--no-intermediates",
+        action="store_true",
+        help="Do not save separate binary mask, segment mask, and order=3 supersegment images.",
+    )
     parser.add_argument("--dpi", type=int, default=300)
     return parser.parse_args()
 
@@ -610,6 +615,32 @@ def _split_outputs(output: str, overview_output: Optional[str], supersegment_out
     if supersegment_output is None:
         supersegment_output = str(output_path.with_name(f"{output_path.stem}_orders{output_path.suffix}"))
     return overview_output, supersegment_output
+
+
+def _intermediate_output_paths(overview_output: str) -> Dict[str, Path]:
+    overview_path = Path(overview_output)
+    stem = overview_path.stem
+    if stem.endswith("_overview"):
+        stem = stem[: -len("_overview")]
+    return {
+        "binary_mask": overview_path.with_name(f"{stem}_binary_mask.png"),
+        "segment_mask": overview_path.with_name(f"{stem}_segment_mask.png"),
+        "supersegment_order3": overview_path.with_name(f"{stem}_supersegment_order3.png"),
+    }
+
+
+def _save_intermediate_panels(overview_panels: Sequence[Tuple[str, np.ndarray]], overview_output: str, dpi: int) -> Dict[str, Path]:
+    paths = _intermediate_output_paths(overview_output)
+    panel_by_key = {
+        "binary_mask": overview_panels[1][1],
+        "segment_mask": overview_panels[2][1],
+        "supersegment_order3": overview_panels[3][1],
+    }
+    for key, image in panel_by_key.items():
+        out_path = paths[key]
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(image).save(out_path, dpi=(dpi, dpi))
+    return paths
 
 
 def _render_visualization(
@@ -694,6 +725,9 @@ def _render_visualization(
         )
 
     overview_output, supersegment_output = _split_outputs(output, overview_output, supersegment_output)
+    intermediate_paths = None
+    if not args.no_intermediates:
+        intermediate_paths = _save_intermediate_panels(overview_panels, overview_output, dpi=args.dpi)
     overview_path, overview_pdf_path = _compose_grid(
         overview_panels,
         output=overview_output,
@@ -729,6 +763,9 @@ def _render_visualization(
         print(f"[ok] saved {supersegment_path}")
         if supersegment_pdf_path is not None:
             print(f"[ok] saved {supersegment_pdf_path}")
+        if intermediate_paths is not None:
+            for path in intermediate_paths.values():
+                print(f"[ok] saved {path}")
         print(f"image={image_path}")
         print(f"grid_hw={record.grid_hw} segments={mask_grid.shape[0]} selected_segments={selected_ids}")
         if cluster_id is not None:
@@ -791,7 +828,10 @@ def main() -> None:
             stem = _safe_stem(relpath)
             output = str(output_dir / f"{stem}.png")
             overview_output, supersegment_output = _split_outputs(output, None, None)
-            if args.skip_existing and os.path.isfile(overview_output) and os.path.isfile(supersegment_output):
+            expected_outputs: List[Path] = [Path(overview_output), Path(supersegment_output)]
+            if not args.no_intermediates:
+                expected_outputs.extend(_intermediate_output_paths(overview_output).values())
+            if args.skip_existing and all(path.is_file() for path in expected_outputs):
                 print(f"[skip] {pos}/{total} {relpath}")
                 continue
             print(f"[{pos}/{total}] {relpath}")
@@ -808,6 +848,9 @@ def main() -> None:
             )
             print(f"[ok] saved {overview_path}")
             print(f"[ok] saved {supersegment_path}")
+            if not args.no_intermediates:
+                for path in _intermediate_output_paths(overview_output).values():
+                    print(f"[ok] saved {path}")
         return
 
     dataset, index, image_path, relpath = _get_image_context(args, resolved)

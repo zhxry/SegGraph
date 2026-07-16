@@ -9,7 +9,7 @@
 
 
 python scripts/viz_dino_vlad_clusters.py \
-    --image data/Hawaii_wildfire_2023_1_336_intile/tiles/tile_r00_c06.png \
+    --image data/Hawaii_wildfire_2023_1_336_intile/tiles/tile_r01_c00.png \
     --c-centers /data/zhanghaofei/xry/Revisit-Anything/cache/vocabulary/dinov2_vitg14/l31_value_c32/VPAir/c_centers.pt \
     --output-dir viz/vlad_vocab \
     --no-headers \
